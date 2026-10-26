@@ -43,14 +43,15 @@ why POST isn't retried, liveness vs readiness.
 
 ## Phase 2 (week 2): resilience
 
-- [ ] **Passive health / outlier ejection:** eject a backend after N consecutive 5xx/transport errors, before the next active probe
-- [ ] **Retry budget:** retries capped at ~20% of request volume, so retries can't amplify an outage (retry storm)
-- [ ] **Per-try timeout** separate from the overall request deadline
-- [ ] **Circuit breaker** per backend (closed → open → half-open)
-- [ ] **Power-of-two-choices** balancer (what Envoy/Finagle use) and benchmark it against least-conn
-- [ ] **Weighted backends** (smooth weighted round robin, the Nginx algorithm)
-- [ ] **Hot reload:** swap the backend set on config-file change via `atomic.Pointer`, without dropping requests
-- [ ] Fuzz test the config parser; run all tests with `-race`
+- [x] **Passive health / outlier ejection:** eject a backend after N consecutive 5xx/transport errors, before the next active probe; never eject more than `max_ejection_percent` of the pool
+- [x] **Retry budget:** retries capped at 20% of request volume over 10 s (with a 10/s floor), so retries can't amplify an outage (retry storm)
+- [x] **Per-try timeout:** `timeouts.response_header` bounds each attempt's time to first byte; there's deliberately no whole-request deadline, so long streaming responses aren't cut off
+- [x] **Circuit breaker** per backend (closed → open → half-open), with exponential ejection backoff
+- [x] **Load shedding:** `max_inflight_per_backend` stops sending to a saturated backend
+- [x] **Power-of-two-choices** balancer (what Envoy/Finagle use); benchmarked against least-conn in Phase 5
+- [x] **Weighted backends** (smooth weighted round robin, the Nginx algorithm)
+- [x] **Hot reload:** file watch, SIGHUP or `POST /-/reload`; the new pool is probed, then swapped in via `atomic.Pointer` without dropping requests; invalid configs are rejected
+- [x] Fuzz test the config parser (30 s in CI); all tests run with `-race`
 
 **Done when:** killing a backend mid-load causes < 0.1% failed requests.
 

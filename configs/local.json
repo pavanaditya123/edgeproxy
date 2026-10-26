@@ -7,7 +7,7 @@
   "backends": [
     "http://127.0.0.1:9001",
     "http://127.0.0.1:9002",
-    "http://127.0.0.1:9003"
+    { "url": "http://127.0.0.1:9003", "weight": 2 }
   ],
   "health_check": {
     "path": "/healthz",
@@ -16,6 +16,18 @@
     "healthy_threshold": 2,
     "unhealthy_threshold": 2
   },
+  "outlier_detection": {
+    "consecutive_failures": 5,
+    "base_ejection_time": "10s",
+    "max_ejection_time": "5m",
+    "max_ejection_percent": 50
+  },
+  "retry_budget": {
+    "ratio": 0.2,
+    "min_retries_per_second": 10
+  },
+  "max_inflight_per_backend": 0,
+  "reload_interval": "2s",
   "timeouts": {
     "dial": "1s",
     "read_header": "5s",
