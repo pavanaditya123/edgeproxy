@@ -45,9 +45,10 @@ func run(configPath string, logger *slog.Logger) error {
 			ResponseHeaderTimeout: cfg.Timeouts.ResponseHeader.Std(),
 			IdleConnTimeout:       cfg.Timeouts.IdleConn.Std(),
 		}),
-		MaxRetries: cfg.MaxRetries,
-		Metrics:    m,
-		Logger:     logger,
+		MaxRetries:  cfg.MaxRetries,
+		RetryBudget: proxy.NewRetryBudget(cfg.RetryBudget.Ratio, cfg.RetryBudget.MinRetriesPerSecond),
+		Metrics:     m,
+		Logger:      logger,
 	})
 	m.WatchBackends(px.Backends)
 

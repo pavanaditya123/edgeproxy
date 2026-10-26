@@ -207,6 +207,22 @@ func TestProxyEjectsBackendThatKeepsReturning5xx(t *testing.T) {
 	}
 }
 
+func TestProxyStopsRetryingWhenBudgetIsEmpty(t *testing.T) {
+	srv, _, m, p := newTestProxyWith(t, nil, deadServer(), liveServer(t, "live"))
+	p.budget = NewRetryBudget(0, 0) // no retries at all
+
+	// Round robin starts on the dead backend; with no budget there's no retry.
+	if code, _ := get(t, srv.URL); code != http.StatusBadGateway {
+		t.Fatalf("status %d, want 502 because the retry was refused", code)
+	}
+	if got := testutil.ToFloat64(m.RetryBudgetExhausted); got != 1 {
+		t.Errorf("retry budget exhausted = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.Retries); got != 0 {
+		t.Errorf("retries = %v, want 0", got)
+	}
+}
+
 func TestProxySkipsBackendAtCapacity(t *testing.T) {
 	srv, bs, _ := newTestProxy(t, liveServer(t, "a"), liveServer(t, "b"))
 	bs[0].SetMaxInflight(1)

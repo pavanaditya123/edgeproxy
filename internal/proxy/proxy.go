@@ -23,8 +23,10 @@ type Config struct {
 	Transport http.RoundTripper
 	// MaxRetries is how many other backends a failed retryable request may be tried on.
 	MaxRetries int
-	Metrics    *metrics.Metrics
-	Logger     *slog.Logger
+	// RetryBudget caps retries across all requests; nil means no cap.
+	RetryBudget *RetryBudget
+	Metrics     *metrics.Metrics
+	Logger      *slog.Logger
 }
 
 type Proxy struct {
@@ -32,6 +34,7 @@ type Proxy struct {
 	transport  http.RoundTripper
 	errorLog   *log.Logger
 	maxRetries int
+	budget     *RetryBudget
 	metrics    *metrics.Metrics
 	logger     *slog.Logger
 }
@@ -52,6 +55,7 @@ func New(cfg Config) *Proxy {
 		transport:  cfg.Transport,
 		errorLog:   slog.NewLogLogger(cfg.Logger.Handler(), slog.LevelWarn),
 		maxRetries: cfg.MaxRetries,
+		budget:     cfg.RetryBudget,
 		metrics:    cfg.Metrics,
 		logger:     cfg.Logger,
 	}
@@ -126,6 +130,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	pl := p.pool.Load()
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	p.budget.RecordRequest()
 
 	attempts := 1
 	if isRetryable(r) {
@@ -142,6 +147,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if len(tried) > 0 {
+			if !p.budget.TryRetry() {
+				p.metrics.RetryBudgetExhausted.Inc()
+				break
+			}
 			p.metrics.Retries.Inc()
 		}
 		tried = append(tried, b)

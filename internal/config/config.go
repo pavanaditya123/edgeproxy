@@ -23,6 +23,14 @@ type Config struct {
 	// MaxInflightPerBackend caps concurrent requests to any one backend; 0 means no cap.
 	MaxInflightPerBackend int              `json:"max_inflight_per_backend"`
 	OutlierDetection      OutlierDetection `json:"outlier_detection"`
+	RetryBudget           RetryBudget      `json:"retry_budget"`
+}
+
+// RetryBudget caps retries over the last 10 seconds at Ratio of requests, or
+// MinRetriesPerSecond per second if that's larger.
+type RetryBudget struct {
+	Ratio               float64 `json:"ratio"`
+	MinRetriesPerSecond int     `json:"min_retries_per_second"`
 }
 
 // OutlierDetection configures passive health checking (see package outlier).
@@ -107,6 +115,7 @@ func Default() *Config {
 			MaxEjectionTime:     Duration(5 * time.Minute),
 			MaxEjectionPercent:  50,
 		},
+		RetryBudget: RetryBudget{Ratio: 0.2, MinRetriesPerSecond: 10},
 	}
 }
 
@@ -193,6 +202,9 @@ func (c *Config) Validate() error {
 		if od.MaxEjectionPercent < 1 || od.MaxEjectionPercent > 100 {
 			errs = append(errs, errors.New("outlier_detection.max_ejection_percent must be between 1 and 100"))
 		}
+	}
+	if rb := c.RetryBudget; rb.Ratio < 0 || rb.Ratio > 1 || rb.MinRetriesPerSecond < 0 {
+		errs = append(errs, errors.New("retry_budget needs 0 <= ratio <= 1 and min_retries_per_second >= 0"))
 	}
 	return errors.Join(errs...)
 }
