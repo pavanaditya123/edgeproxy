@@ -57,14 +57,14 @@ why POST isn't retried, liveness vs readiness.
 
 ## Phase 3 (week 3): rate limiting
 
-- [ ] Middleware chain (`func(http.Handler) http.Handler`)
-- [ ] **Local token bucket** per key (client IP / API key header) with bounded memory (LRU eviction)
-- [ ] Standard response headers: `429`, `Retry-After`, `RateLimit-Limit/Remaining/Reset`
-- [ ] **Distributed limiter:** sliding-window counter in Redis, made atomic with a Lua script, so several proxy instances share one limit
-- [ ] **Failure mode:** if Redis is down, fail open to the local limiter (and expose a metric + alert)
-- [ ] Per-route rules in config (e.g. `/login` 5/min, `/api/*` 100/s)
-- [ ] Measure the added p99 latency of the Redis round trip
-- [ ] **E2E tests in CI** (Redis as a GitHub Actions service container): over-limit requests get `429` + `Retry-After`; two proxies sharing one Redis enforce one shared limit; stopping Redis fails open to the local limiter
+- [x] Middleware chain (`func(http.Handler) http.Handler`)
+- [x] **Local token bucket** per key (client IP / API key header) with bounded memory (16 locked shards, LRU eviction)
+- [x] Standard response headers: `429`, `Retry-After`, `RateLimit-Limit/Remaining/Reset`
+- [x] **Distributed limiter:** sliding-window counter in Redis, made atomic with a Lua script (Redis Cluster hash tags), so several proxy instances share one limit
+- [x] **Failure mode:** `on_redis_error` = `local` (default) / `allow` / `deny`, with a metric and an alert
+- [x] Per-route rules in config (e.g. `POST /login` 5/min, `/` 100/s per API key), reloadable without a restart
+- [ ] Measure the added p99 latency of the Redis round trip (Phase 5 load tests)
+- [x] **E2E tests in CI** (Redis as a GitHub Actions service container): over-limit requests get `429` + `Retry-After`; per-API-key quotas; two proxies sharing one Redis enforce one shared limit; stopping Redis falls back to the local limiter
 
 **Interview topics:** token bucket vs leaky bucket vs sliding window, race
 conditions without Lua/`MULTI`, fail-open vs fail-closed, hot keys.

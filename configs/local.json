@@ -28,6 +28,14 @@
   },
   "max_inflight_per_backend": 0,
   "reload_interval": "2s",
+  "rate_limit": {
+    "redis": { "addr": "", "password_env": "REDIS_PASSWORD", "timeout": "50ms" },
+    "on_redis_error": "local",
+    "rules": [
+      { "name": "login", "path_prefix": "/login", "methods": ["POST"], "limit": 5, "window": "1m" },
+      { "name": "api", "path_prefix": "/", "limit": 100, "window": "1s", "key": "header:X-API-Key" }
+    ]
+  },
   "timeouts": {
     "dial": "1s",
     "read_header": "5s",

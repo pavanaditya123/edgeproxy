@@ -17,6 +17,19 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
+// The shipped example configs must always load.
+func TestExampleConfigsAreValid(t *testing.T) {
+	paths, err := filepath.Glob("../../configs/*.json")
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("no example configs found: %v", err)
+	}
+	for _, p := range paths {
+		if _, err := Load(p); err != nil {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
+}
+
 func TestLoadAppliesDefaults(t *testing.T) {
 	cfg, err := Load(writeConfig(t, `{"backends": ["http://127.0.0.1:9001"], "health_check": {"interval": "10s"}}`))
 	if err != nil {
