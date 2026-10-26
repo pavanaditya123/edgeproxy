@@ -239,6 +239,24 @@ func (ep *edgeProxy) fetch(method, path string, headers map[string]string, body 
 	return resp.StatusCode, e, nil
 }
 
+// do sends a request through the proxy and returns the status and headers.
+func (ep *edgeProxy) do(method, path string, headers map[string]string) (int, http.Header, error) {
+	req, err := http.NewRequest(method, ep.url+path, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, resp.Header, nil
+}
+
 // whoAnswers sends a GET and returns the name of the backend that served it.
 func (ep *edgeProxy) whoAnswers(t *testing.T, headers map[string]string) string {
 	t.Helper()

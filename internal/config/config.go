@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
+
+	"edgeproxy/internal/reqkey"
 )
 
 type Config struct {
@@ -28,6 +31,41 @@ type Config struct {
 	// ReloadInterval is how often the config file is checked for changes; 0 disables
 	// file watching (SIGHUP and POST /-/reload still work).
 	ReloadInterval Duration `json:"reload_interval"`
+
+	RateLimit RateLimit `json:"rate_limit"`
+}
+
+// RateLimit configures request rate limiting. With no rules nothing is limited.
+type RateLimit struct {
+	// Redis, if addr is set, shares limits across every proxy instance.
+	Redis Redis `json:"redis"`
+	// OnRedisError is "local" (enforce per instance from memory), "allow" or "deny".
+	OnRedisError string `json:"on_redis_error"`
+	// MaxKeys bounds how many distinct clients the in-memory limiter tracks.
+	MaxKeys int `json:"max_keys"`
+	// Rules are checked in order; the first that matches a request applies.
+	Rules []RateLimitRule `json:"rules"`
+}
+
+type Redis struct {
+	Addr string `json:"addr"`
+	// PasswordEnv names the environment variable holding the password, so it
+	// never has to be written into the config file.
+	PasswordEnv string   `json:"password_env"`
+	DB          int      `json:"db"`
+	Timeout     Duration `json:"timeout"`
+	KeyPrefix   string   `json:"key_prefix"`
+}
+
+type RateLimitRule struct {
+	Name       string `json:"name"`
+	PathPrefix string `json:"path_prefix"`
+	// Methods restricts the rule to these HTTP methods; empty means all.
+	Methods []string `json:"methods"`
+	Limit   int      `json:"limit"`
+	Window  Duration `json:"window"`
+	// Key is who the limit applies to: "client_ip" or "header:<Name>".
+	Key string `json:"key"`
 }
 
 // RetryBudget caps retries over the last 10 seconds at Ratio of requests, or
@@ -148,6 +186,11 @@ func Default() *Config {
 		},
 		RetryBudget:    RetryBudget{Ratio: 0.2, MinRetriesPerSecond: 10},
 		ReloadInterval: Duration(2 * time.Second),
+		RateLimit: RateLimit{
+			Redis:        Redis{Timeout: Duration(50 * time.Millisecond), KeyPrefix: "edgeproxy:rl:"},
+			OnRedisError: "local",
+			MaxKeys:      100_000,
+		},
 	}
 }
 
@@ -259,5 +302,47 @@ func (c *Config) Validate() error {
 	if c.ReloadInterval < 0 {
 		errs = append(errs, errors.New("reload_interval must not be negative"))
 	}
+	errs = append(errs, c.RateLimit.validate()...)
 	return errors.Join(errs...)
+}
+
+func (rl *RateLimit) validate() []error {
+	var errs []error
+	switch rl.OnRedisError {
+	case "local", "allow", "deny":
+	default:
+		errs = append(errs, fmt.Errorf("rate_limit.on_redis_error %q must be local, allow or deny", rl.OnRedisError))
+	}
+	if rl.MaxKeys < 1 {
+		errs = append(errs, errors.New("rate_limit.max_keys must be at least 1"))
+	}
+	if rl.Redis.Addr != "" && rl.Redis.Timeout <= 0 {
+		errs = append(errs, errors.New("rate_limit.redis.timeout must be positive"))
+	}
+	names := make(map[string]bool, len(rl.Rules))
+	for i, r := range rl.Rules {
+		where := fmt.Sprintf("rate_limit.rules[%d]", i)
+		if r.Name == "" || names[r.Name] {
+			errs = append(errs, fmt.Errorf("%s: name must be set and unique", where))
+		}
+		names[r.Name] = true
+		if !strings.HasPrefix(r.PathPrefix, "/") {
+			errs = append(errs, fmt.Errorf("%s: path_prefix must start with /", where))
+		}
+		if r.Limit < 1 {
+			errs = append(errs, fmt.Errorf("%s: limit must be at least 1", where))
+		}
+		if r.Window < Duration(100*time.Millisecond) {
+			errs = append(errs, fmt.Errorf("%s: window must be at least 100ms", where))
+		}
+		if _, err := reqkey.Parse(r.Key); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", where, err))
+		}
+		for _, m := range r.Methods {
+			if m == "" || strings.ToUpper(m) != m {
+				errs = append(errs, fmt.Errorf("%s: method %q must be upper case, like GET", where, m))
+			}
+		}
+	}
+	return errs
 }

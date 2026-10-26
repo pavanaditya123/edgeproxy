@@ -53,11 +53,13 @@ func run(configPath string, logger *slog.Logger) error {
 		Logger:      logger,
 	})
 	m.WatchBackends(px.Backends)
+	limiter, closeRedis := newLimiter(cfg, m, logger)
+	defer closeRedis()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv := &server{configPath: configPath, boot: cfg, px: px, metrics: m, logger: logger, lastConfigSum: sha256.Sum256(data)}
+	srv := &server{configPath: configPath, boot: cfg, px: px, limiter: limiter, metrics: m, logger: logger, lastConfigSum: sha256.Sum256(data)}
 	// The first apply probes every backend before the listener opens, so the
 	// first requests don't hit dead backends.
 	if err := srv.apply(ctx, cfg); err != nil {
@@ -71,7 +73,7 @@ func run(configPath string, logger *slog.Logger) error {
 	})
 	public := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           px,
+		Handler:           limiter.Middleware(px),
 		ReadHeaderTimeout: cfg.Timeouts.ReadHeader.Std(),
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),

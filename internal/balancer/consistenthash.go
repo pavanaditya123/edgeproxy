@@ -2,16 +2,14 @@ package balancer
 
 import (
 	"cmp"
-	"errors"
 	"fmt"
 	"hash/fnv"
-	"net"
 	"net/http"
 	"slices"
 	"strconv"
-	"strings"
 
 	"edgeproxy/internal/backend"
+	"edgeproxy/internal/reqkey"
 )
 
 // DefaultReplicas is the number of virtual nodes per backend. More nodes give a
@@ -62,6 +60,15 @@ func (c *ConsistentHash) Next(r *http.Request, eligible Eligible) *backend.Backe
 	return nil
 }
 
+// KeyFunc builds the hash-key extractor for a hash_key config value; see reqkey.Parse.
+func KeyFunc(spec string) (KeyFn, error) {
+	fn, err := reqkey.Parse(spec)
+	if err != nil {
+		return nil, fmt.Errorf("hash_key: %w", err)
+	}
+	return KeyFn(fn), nil
+}
+
 func hashString(s string) uint64 {
 	h := fnv.New64a()
 	h.Write([]byte(s))
@@ -77,36 +84,4 @@ func mix64(x uint64) uint64 {
 	x *= 0x94d049bb133111eb
 	x ^= x >> 31
 	return x
-}
-
-// KeyFunc builds the hash-key extractor for a hash_key config value:
-// "client_ip" hashes on the TCP peer address, and "header:<Name>" hashes on a
-// request header, falling back to the client IP when the header is absent.
-func KeyFunc(spec string) (KeyFn, error) {
-	switch {
-	case spec == "" || spec == "client_ip":
-		return clientIP, nil
-	case strings.HasPrefix(spec, "header:"):
-		name := strings.TrimSpace(strings.TrimPrefix(spec, "header:"))
-		if name == "" {
-			return nil, errors.New(`hash_key "header:" needs a header name`)
-		}
-		return func(r *http.Request) string {
-			if v := r.Header.Get(name); v != "" {
-				return v
-			}
-			return clientIP(r)
-		}, nil
-	}
-	return nil, fmt.Errorf("unknown hash_key %q", spec)
-}
-
-// clientIP returns the TCP peer's IP. It deliberately ignores X-Forwarded-For,
-// which any client can forge.
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }

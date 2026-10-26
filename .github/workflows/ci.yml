@@ -90,6 +90,17 @@ jobs:
     needs: [lint, unit]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # A real Redis, so the shared rate-limit test exercises the actual Lua
+    # script rather than an emulator.
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
 
@@ -98,9 +109,10 @@ jobs:
           go-version-file: go.mod
 
       # Builds edgeproxy and demobackend (with the race detector), runs them as
-      # real processes and checks load balancing, health checks, retries and
-      # graceful shutdown over real HTTP. See e2e/e2e_test.go.
+      # real processes and checks load balancing, health checks, retries,
+      # rate limiting, config reload and graceful shutdown over real HTTP.
       - name: Run end-to-end tests
         env:
           E2E_RACE: "1"
+          E2E_REDIS_ADDR: localhost:6379
         run: go test -tags e2e -count=1 -v ./e2e/

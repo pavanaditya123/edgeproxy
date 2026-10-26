@@ -60,6 +60,24 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestRateLimitRulesAreValidated(t *testing.T) {
+	_, err := Load(writeConfig(t, `{
+		"backends": ["http://a:1"],
+		"rate_limit": {"on_redis_error": "maybe", "rules": [
+			{"name": "a", "path_prefix": "login", "limit": 0, "window": "10ms", "key": "cookie:x", "methods": ["post"]},
+			{"name": "a", "path_prefix": "/", "limit": 5, "window": "1s"}
+		]}
+	}`))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{"on_redis_error", "unique", "path_prefix", "limit must be", "window", "cookie:x", `"post"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not mention %q:\n%v", want, err)
+		}
+	}
+}
+
 func TestValidateReportsAllProblems(t *testing.T) {
 	_, err := Load(writeConfig(t, `{"strategy": "random", "max_retries": 50}`))
 	if err == nil {

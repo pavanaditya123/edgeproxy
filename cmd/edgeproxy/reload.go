@@ -17,6 +17,7 @@ import (
 	"edgeproxy/internal/health"
 	"edgeproxy/internal/metrics"
 	"edgeproxy/internal/proxy"
+	"edgeproxy/internal/ratelimit"
 )
 
 // server owns the live config and swaps in a new backend pool on reload.
@@ -24,6 +25,7 @@ type server struct {
 	configPath string
 	boot       *config.Config // the config the process started with
 	px         *proxy.Proxy
+	limiter    *ratelimit.Limiter
 	metrics    *metrics.Metrics
 	logger     *slog.Logger
 
@@ -44,6 +46,10 @@ func (s *server) apply(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
+	rules, err := buildRules(cfg)
+	if err != nil {
+		return err
+	}
 	checker := health.New(health.Config{
 		Path:               cfg.HealthCheck.Path,
 		Interval:           cfg.HealthCheck.Interval.Std(),
@@ -61,6 +67,7 @@ func (s *server) apply(ctx context.Context, cfg *config.Config) error {
 		Outlier:    newDetector(cfg, backends),
 		MaxRetries: cfg.MaxRetries,
 	})
+	s.limiter.SetRules(rules)
 
 	if s.stopChecker != nil {
 		s.stopChecker()
@@ -156,5 +163,8 @@ func restartOnlyChanges(boot, next *config.Config) []string {
 	check("timeouts", boot.Timeouts, next.Timeouts)
 	check("retry_budget", boot.RetryBudget, next.RetryBudget)
 	check("reload_interval", boot.ReloadInterval, next.ReloadInterval)
+	check("rate_limit.redis", boot.RateLimit.Redis, next.RateLimit.Redis)
+	check("rate_limit.on_redis_error", boot.RateLimit.OnRedisError, next.RateLimit.OnRedisError)
+	check("rate_limit.max_keys", boot.RateLimit.MaxKeys, next.RateLimit.MaxKeys)
 	return fields
 }

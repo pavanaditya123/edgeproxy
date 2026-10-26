@@ -75,7 +75,7 @@ func New() *Metrics {
 		}, []string{"rule"}),
 		RateLimitFallbacks: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "edgeproxy_rate_limit_fallbacks_total",
-			Help: "Rate-limit checks answered by the local limiter because Redis failed.",
+			Help: "Rate-limit checks where Redis failed and the on_redis_error policy was applied.",
 		}),
 		ConfigReloads: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "edgeproxy_config_reloads_total",

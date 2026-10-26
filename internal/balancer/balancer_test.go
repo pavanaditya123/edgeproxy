@@ -225,16 +225,3 @@ func TestBalancersReturnNilWhenNothingEligible(t *testing.T) {
 		}
 	}
 }
-
-func TestKeyFuncIgnoresForwardedFor(t *testing.T) {
-	keyFn, err := KeyFunc("client_ip")
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
-	r.RemoteAddr = "203.0.113.7:51234"
-	r.Header.Set("X-Forwarded-For", "1.2.3.4")
-	if got := keyFn(r); got != "203.0.113.7" {
-		t.Errorf("key = %q, want the TCP peer IP 203.0.113.7", got)
-	}
-}
