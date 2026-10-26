@@ -82,7 +82,7 @@ func run(configPath string, logger *slog.Logger) error {
 	if err := srv.apply(ctx, cfg); err != nil {
 		return err
 	}
-	go srv.watch(ctx, cfg.ReloadInterval.Std())
+	go srv.watch(ctx, cfg.ReloadInterval.Std(), cfg.Discovery.Interval.Std())
 
 	var draining atomic.Bool
 	admin := newAdminServer(cfg.AdminListen, m, px.Backends, &draining, func() error {
@@ -111,7 +111,7 @@ func run(configPath string, logger *slog.Logger) error {
 	go func() { errc <- serve(admin) }()
 	go func() { errc <- serve(public) }()
 	logger.Info("edgeproxy started",
-		"listen", cfg.Listen, "admin", cfg.AdminListen, "strategy", cfg.Strategy, "backends", len(cfg.Backends))
+		"listen", cfg.Listen, "admin", cfg.AdminListen, "strategy", cfg.Strategy, "backends", len(px.Backends()))
 
 	select {
 	case err := <-errc:

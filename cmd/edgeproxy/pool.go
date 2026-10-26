@@ -6,15 +6,15 @@ import (
 	"edgeproxy/internal/outlier"
 )
 
-// buildBackends creates the backends listed in cfg, reusing any in prev with
-// the same URL so their health and outlier state carry over.
-func buildBackends(cfg *config.Config, prev []*backend.Backend) ([]*backend.Backend, error) {
+// buildBackends creates a backend per spec, reusing any in prev with the same
+// URL so their health and outlier state carry over.
+func buildBackends(specs []config.BackendSpec, maxInflight int, prev []*backend.Backend) ([]*backend.Backend, error) {
 	existing := make(map[string]*backend.Backend, len(prev))
 	for _, b := range prev {
 		existing[b.URL.String()] = b
 	}
-	backends := make([]*backend.Backend, 0, len(cfg.Backends))
-	for _, spec := range cfg.Backends {
+	backends := make([]*backend.Backend, 0, len(specs))
+	for _, spec := range specs {
 		b, err := backend.New(spec.URL)
 		if err != nil {
 			return nil, err
@@ -23,7 +23,7 @@ func buildBackends(cfg *config.Config, prev []*backend.Backend) ([]*backend.Back
 			b = old
 		}
 		b.SetWeight(spec.Weight)
-		b.SetMaxInflight(cfg.MaxInflightPerBackend)
+		b.SetMaxInflight(maxInflight)
 		backends = append(backends, b)
 	}
 	return backends, nil

@@ -23,6 +23,7 @@ func TestExampleConfigsAreValid(t *testing.T) {
 	if err != nil || len(paths) == 0 {
 		t.Fatalf("no example configs found: %v", err)
 	}
+	paths = append(paths, "../../deploy/compose/edgeproxy.json")
 	for _, p := range paths {
 		if _, err := Load(p); err != nil {
 			t.Errorf("%s: %v", p, err)

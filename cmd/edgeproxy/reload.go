@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"reflect"
@@ -29,16 +30,59 @@ type server struct {
 	metrics    *metrics.Metrics
 	logger     *slog.Logger
 
-	mu            sync.Mutex // serialises reloads
+	// lookup resolves discovery names; nil means the system resolver.
+	lookup lookupFunc
+
+	mu            sync.Mutex // serialises reloads and discovery updates
 	stopChecker   context.CancelFunc
 	lastConfigSum [sha256.Size]byte
+	cfg           *config.Config // the config currently applied
+	discovered    discovered
+	backendKey    string
 }
 
-// apply builds a backend pool from cfg, probes it, swaps it in, and restarts
-// health checking on it. Backends that exist in both the old and new config
-// keep their health and outlier state.
+// apply resolves cfg's backends (static plus DNS-discovered) and applies them.
 func (s *server) apply(ctx context.Context, cfg *config.Config) error {
-	backends, err := buildBackends(cfg, s.px.Backends())
+	specs, found := resolveBackends(ctx, cfg, s.discovered, s.resolver(), s.logger)
+	if err := s.applySpecs(ctx, cfg, specs); err != nil {
+		return err
+	}
+	s.discovered = found
+	return nil
+}
+
+// rediscover re-resolves the discovery names and swaps in a new pool only if
+// the set of backends changed.
+func (s *server) rediscover(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg == nil || len(s.cfg.Discovery.DNS) == 0 {
+		return
+	}
+	specs, found := resolveBackends(ctx, s.cfg, s.discovered, s.resolver(), s.logger)
+	s.discovered = found
+	if backendSetKey(specs) == s.backendKey {
+		return
+	}
+	if err := s.applySpecs(ctx, s.cfg, specs); err != nil {
+		s.logger.Error("applying discovered backends failed", "error", err)
+		return
+	}
+	s.logger.Info("discovered backends changed", "backends", len(specs))
+}
+
+func (s *server) resolver() lookupFunc {
+	if s.lookup != nil {
+		return s.lookup
+	}
+	return net.DefaultResolver.LookupHost
+}
+
+// applySpecs builds a backend pool from specs, probes it, swaps it in, and
+// restarts health checking on it. Backends present in both the old and new
+// pool keep their health and outlier state.
+func (s *server) applySpecs(ctx context.Context, cfg *config.Config, specs []config.BackendSpec) error {
+	backends, err := buildBackends(specs, cfg.MaxInflightPerBackend, s.px.Backends())
 	if err != nil {
 		return err
 	}
@@ -75,6 +119,9 @@ func (s *server) apply(ctx context.Context, cfg *config.Config) error {
 	checkerCtx, cancel := context.WithCancel(ctx)
 	s.stopChecker = cancel
 	go checker.Run(checkerCtx)
+
+	s.cfg = cfg
+	s.backendKey = backendSetKey(specs)
 	return nil
 }
 
@@ -111,9 +158,10 @@ func (s *server) reload(ctx context.Context, trigger string) error {
 	return nil
 }
 
-// watch reloads on SIGHUP, and whenever the config file's contents change if
-// interval > 0, until ctx is done.
-func (s *server) watch(ctx context.Context, interval time.Duration) {
+// watch reloads on SIGHUP and, if interval > 0, whenever the config file's
+// contents change. Every discoveryInterval it re-resolves discovery names.
+// It returns when ctx is done.
+func (s *server) watch(ctx context.Context, interval, discoveryInterval time.Duration) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
@@ -124,6 +172,8 @@ func (s *server) watch(ctx context.Context, interval time.Duration) {
 		defer t.Stop()
 		tick = t.C
 	}
+	discover := time.NewTicker(discoveryInterval)
+	defer discover.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -134,6 +184,8 @@ func (s *server) watch(ctx context.Context, interval time.Duration) {
 			if s.fileChanged() {
 				_ = s.reload(ctx, "file change")
 			}
+		case <-discover.C:
+			s.rediscover(ctx)
 		}
 	}
 }
@@ -168,5 +220,6 @@ func restartOnlyChanges(boot, next *config.Config) []string {
 	check("rate_limit.max_keys", boot.RateLimit.MaxKeys, next.RateLimit.MaxKeys)
 	check("access_log", boot.AccessLog, next.AccessLog)
 	check("tracing", boot.Tracing, next.Tracing)
+	check("discovery.interval", boot.Discovery.Interval, next.Discovery.Interval)
 	return fields
 }

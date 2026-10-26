@@ -37,6 +37,23 @@ type Config struct {
 	// AccessLog writes one JSON log line per request.
 	AccessLog bool    `json:"access_log"`
 	Tracing   Tracing `json:"tracing"`
+
+	Discovery Discovery `json:"discovery"`
+}
+
+// Discovery adds backends found through DNS to the static list. Each name is
+// re-resolved every Interval, and every address it returns becomes a backend;
+// a Kubernetes headless Service resolves to all of its ready pods this way.
+type Discovery struct {
+	DNS      []DNSTarget `json:"dns"`
+	Interval Duration    `json:"interval"`
+}
+
+type DNSTarget struct {
+	Host string `json:"host"`
+	Port int    `json:"port"`
+	// Scheme is "http" (the default) or "https".
+	Scheme string `json:"scheme"`
 }
 
 // Tracing exports OpenTelemetry traces over OTLP/HTTP.
@@ -212,6 +229,7 @@ func Default() *Config {
 			SampleRatio: 1,
 			ServiceName: "edgeproxy",
 		},
+		Discovery: Discovery{Interval: Duration(10 * time.Second)},
 	}
 }
 
@@ -240,6 +258,11 @@ func Parse(data []byte) (*Config, error) {
 	if dec.More() {
 		return nil, errors.New("parse: unexpected data after the config object")
 	}
+	for i := range cfg.Discovery.DNS {
+		if cfg.Discovery.DNS[i].Scheme == "" {
+			cfg.Discovery.DNS[i].Scheme = "http"
+		}
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
@@ -266,8 +289,16 @@ func (c *Config) Validate() error {
 	if c.MaxRetries < 0 || c.MaxRetries > 10 {
 		errs = append(errs, fmt.Errorf("max_retries %d must be between 0 and 10", c.MaxRetries))
 	}
-	if len(c.Backends) == 0 {
-		errs = append(errs, errors.New("at least one backend is required"))
+	if len(c.Backends) == 0 && len(c.Discovery.DNS) == 0 {
+		errs = append(errs, errors.New("at least one backend (or a discovery.dns entry) is required"))
+	}
+	for i, d := range c.Discovery.DNS {
+		if d.Host == "" || d.Port < 1 || d.Port > 65535 || (d.Scheme != "http" && d.Scheme != "https") {
+			errs = append(errs, fmt.Errorf("discovery.dns[%d] needs a host, a port between 1 and 65535, and scheme http or https", i))
+		}
+	}
+	if len(c.Discovery.DNS) > 0 && c.Discovery.Interval < Duration(time.Second) {
+		errs = append(errs, errors.New("discovery.interval must be at least 1s"))
 	}
 	seen := make(map[string]bool, len(c.Backends))
 	for _, b := range c.Backends {

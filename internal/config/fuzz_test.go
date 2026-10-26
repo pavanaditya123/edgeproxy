@@ -33,8 +33,8 @@ func FuzzParse(f *testing.F) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Parse accepted a config that fails validation: %v", err)
 		}
-		if len(cfg.Backends) == 0 {
-			t.Fatal("Parse accepted a config with no backends")
+		if len(cfg.Backends) == 0 && len(cfg.Discovery.DNS) == 0 {
+			t.Fatal("Parse accepted a config with no backends and no discovery")
 		}
 	})
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -307,6 +309,27 @@ func TestInvalidConfigReloadKeepsRunningConfig(t *testing.T) {
 	}
 	if got := ep.metric(t, `edgeproxy_config_reloads_total{result="failure"}`); got < 1 {
 		t.Errorf("failed reloads = %v, want at least 1", got)
+	}
+}
+
+func TestDNSDiscoveryFindsBackends(t *testing.T) {
+	a := startBackend(t, "a")
+	port, _ := strconv.Atoi(a.url[strings.LastIndex(a.url, ":")+1:])
+	// No static backends at all: the only way to reach a is resolving "localhost".
+	ep := startProxy(t, proxyOpts{extra: map[string]any{
+		"backends":  []string{},
+		"discovery": map[string]any{"dns": []any{map[string]any{"host": "localhost", "port": port}}, "interval": "1s"},
+	}})
+
+	if who := ep.whoAnswers(t, nil); who != "a" {
+		t.Fatalf("got %q, want backend a found through DNS", who)
+	}
+	found := false
+	for _, s := range ep.backends(t) {
+		found = found || (s.URL == "http://127.0.0.1:"+strconv.Itoa(port) && s.Alive)
+	}
+	if !found {
+		t.Errorf("/backends = %+v, want the discovered 127.0.0.1:%d listed and alive", ep.backends(t), port)
 	}
 }
 
