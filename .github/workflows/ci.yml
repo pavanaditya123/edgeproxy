@@ -180,7 +180,10 @@ jobs:
           docker compose ps
 
       - name: Load test (1,000 req/s for 30s, under 0.1% errors and 250ms p99)
-        run: docker compose run --rm -T -e RATE=1000 -e DURATION=30s -e LABEL=load k6 run --quiet /scripts/load.js
+        run: |
+          # k6 runs as a non-root user and writes its summary here.
+          mkdir -p loadtest/results && chmod a+w loadtest/results
+          docker compose run --rm -T -e RATE=1000 -e DURATION=30s -e LABEL=load k6 run --quiet /scripts/load.js
 
       - name: Chaos test (kill a backend, slow one down, stop Redis, all under load)
         run: RATE=500 scripts/chaos.sh
@@ -193,7 +196,9 @@ jobs:
             echo '| Run | req/s | Errors | p50 ms | p99 ms |'
             echo '|---|---|---|---|---|'
             for f in loadtest/results/load.json loadtest/results/chaos.json; do
-              [ -f "$f" ] && jq -r '"| \(.label) | \(.rps) | \(.error_rate * 100)% | \(.p50_ms | . * 100 | round / 100) | \(.p99_ms | . * 100 | round / 100) |"' "$f"
+              if [ -f "$f" ]; then
+                jq -r '"| \(.label) | \(.rps) | \(.error_rate * 100)% | \(.p50_ms | . * 100 | round / 100) | \(.p99_ms | . * 100 | round / 100) |"' "$f"
+              fi
             done
           } >> "$GITHUB_STEP_SUMMARY"
 

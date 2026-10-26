@@ -18,6 +18,8 @@ DURATION=${DURATION:-60s}
 MAX_ERROR_RATE=${MAX_ERROR_RATE:-0.001}
 TOXIPROXY=${TOXIPROXY:-http://localhost:8474}
 mkdir -p loadtest/results
+# k6 runs as a non-root user inside its container and writes its summary here.
+chmod a+w loadtest/results
 
 log() { echo "[chaos $(date +%T)] $*"; }
 

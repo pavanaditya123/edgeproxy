@@ -14,6 +14,8 @@ DURATION=${DURATION:-30s}
 STRATEGIES=${STRATEGIES:-"round_robin weighted_round_robin least_conn p2c consistent_hash"}
 CONFIG=deploy/compose/edgeproxy.json
 mkdir -p loadtest/results
+# k6 runs as a non-root user inside its container and writes its summary here.
+chmod a+w loadtest/results
 
 original=$(mktemp)
 cp "$CONFIG" "$original"
