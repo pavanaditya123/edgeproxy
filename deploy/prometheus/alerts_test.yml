@@ -1,0 +1,66 @@
+# Unit tests for alerts.yml. Run with: promtool test rules alerts_test.yml
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: 5% errors for an hour pages on fast budget burn
+    interval: 1m
+    input_series:
+      - series: 'edgeproxy_requests_total{code="200"}'
+        values: "0+950x90"
+      - series: 'edgeproxy_requests_total{code="502"}'
+        values: "0+50x90"
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: EdgeproxyErrorBudgetBurnFast
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: edgeproxy is burning its error budget 14x too fast
+              description: "5% of requests failed over the last hour (SLO allows 0.1%)."
+
+  - name: 0.05% errors stays quiet
+    interval: 1m
+    input_series:
+      - series: 'edgeproxy_requests_total{code="200"}'
+        values: "0+9995x90"
+      - series: 'edgeproxy_requests_total{code="500"}'
+        values: "0+5x90"
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: EdgeproxyErrorBudgetBurnFast
+        exp_alerts: []
+
+  - name: every backend down pages
+    interval: 1m
+    input_series:
+      - series: 'edgeproxy_backend_up{instance="edgeproxy-1:9090",backend="a:9001"}'
+        values: "1 1 0 0 0 0"
+      - series: 'edgeproxy_backend_up{instance="edgeproxy-1:9090",backend="b:9002"}'
+        values: "1 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: EdgeproxyNoHealthyBackends
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              instance: edgeproxy-1:9090
+            exp_annotations:
+              summary: "edgeproxy-1:9090 has no healthy backends; every request gets 503"
+
+  - name: Redis fallback pages
+    interval: 1m
+    input_series:
+      - series: "edgeproxy_rate_limit_fallbacks_total"
+        values: "0+10x10"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: EdgeproxyRateLimiterRedisDown
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: Redis is unreachable; rate limits are enforced per instance only

@@ -1,0 +1,125 @@
+groups:
+  - name: edgeproxy-availability
+    rules:
+      # Error ratio over several windows, recorded once so alerts stay readable.
+      - record: edgeproxy:error_ratio:rate5m
+        expr: |
+          sum(rate(edgeproxy_requests_total{code=~"5.."}[5m]))
+            / sum(rate(edgeproxy_requests_total[5m]))
+      - record: edgeproxy:error_ratio:rate30m
+        expr: |
+          sum(rate(edgeproxy_requests_total{code=~"5.."}[30m]))
+            / sum(rate(edgeproxy_requests_total[30m]))
+      - record: edgeproxy:error_ratio:rate1h
+        expr: |
+          sum(rate(edgeproxy_requests_total{code=~"5.."}[1h]))
+            / sum(rate(edgeproxy_requests_total[1h]))
+      - record: edgeproxy:error_ratio:rate6h
+        expr: |
+          sum(rate(edgeproxy_requests_total{code=~"5.."}[6h]))
+            / sum(rate(edgeproxy_requests_total[6h]))
+
+      # SLO: 99.9% of requests succeed over 30 days (error budget 0.1%).
+      # Multi-window burn-rate alerts from the Google SRE workbook: page when the
+      # budget burns 14.4x too fast (2% of a month's budget in 1h), and open a
+      # ticket at 6x (5% in 6h). Requiring a short window too makes the alert
+      # stop quickly once the problem is fixed.
+      - alert: EdgeproxyErrorBudgetBurnFast
+        expr: |
+          edgeproxy:error_ratio:rate1h > (14.4 * 0.001)
+            and edgeproxy:error_ratio:rate5m > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: edgeproxy is burning its error budget 14x too fast
+          description: "{{ $value | humanizePercentage }} of requests failed over the last hour (SLO allows 0.1%)."
+
+      - alert: EdgeproxyErrorBudgetBurnSlow
+        expr: |
+          edgeproxy:error_ratio:rate6h > (6 * 0.001)
+            and edgeproxy:error_ratio:rate30m > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: edgeproxy is burning its error budget 6x too fast
+          description: "{{ $value | humanizePercentage }} of requests failed over the last 6 hours (SLO allows 0.1%)."
+
+      - alert: EdgeproxyDown
+        expr: up{job="edgeproxy"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "edgeproxy instance {{ $labels.instance }} is not being scraped"
+
+      - alert: EdgeproxyNoHealthyBackends
+        expr: sum by (instance) (edgeproxy_backend_up) == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }} has no healthy backends; every request gets 503"
+
+  - name: edgeproxy-backends
+    rules:
+      - alert: EdgeproxyBackendDown
+        expr: edgeproxy_backend_up == 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Backend {{ $labels.backend }} has failed active health checks for 5 minutes"
+
+      - alert: EdgeproxyBackendRepeatedlyEjected
+        expr: increase(edgeproxy_outlier_ejections_total[15m]) > 3
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Backend {{ $labels.backend }} was ejected by outlier detection {{ $value | humanize }} times in 15 minutes"
+
+      - alert: EdgeproxyHighLatency
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(edgeproxy_request_duration_seconds_bucket[5m]))) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "p99 latency is {{ $value | humanizeDuration }}, above the 500ms objective"
+
+      - alert: EdgeproxyHighRetryRate
+        expr: |
+          sum(rate(edgeproxy_retries_total[5m])) / sum(rate(edgeproxy_requests_total[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "More than 10% of requests need a retry; a backend is failing"
+
+      - alert: EdgeproxyRetryBudgetExhausted
+        expr: sum(rate(edgeproxy_retry_budget_exhausted_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: Retries are being dropped because the retry budget is empty
+
+  - name: edgeproxy-rate-limiting
+    rules:
+      - alert: EdgeproxyRateLimiterRedisDown
+        expr: sum(rate(edgeproxy_rate_limit_fallbacks_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Redis is unreachable; rate limits are enforced per instance only
+
+  - name: edgeproxy-operations
+    rules:
+      - alert: EdgeproxyConfigReloadFailed
+        expr: increase(edgeproxy_config_reloads_total{result="failure"}[15m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A config reload on {{ $labels.instance }} failed; it is still running the previous config"

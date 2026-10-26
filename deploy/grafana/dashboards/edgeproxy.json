@@ -1,0 +1,174 @@
+{
+  "uid": "edgeproxy",
+  "title": "edgeproxy",
+  "description": "RED metrics (rate, errors, duration) per backend, plus health, retries, rate limiting and runtime.",
+  "tags": ["edgeproxy", "load-balancer"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(edgeproxy_requests_total, instance)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Requests / s",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 1 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [{ "refId": "A", "expr": "sum(rate(edgeproxy_requests_total{instance=~\"$instance\"}[1m]))" }]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Error ratio (5xx)",
+      "description": "Share of requests answered with a 5xx. The SLO allows 0.1%.",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit", "decimals": 2,
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "orange", "value": 0.001 }, { "color": "red", "value": 0.01 }
+          ] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area" },
+      "targets": [{ "refId": "A", "expr": "sum(rate(edgeproxy_requests_total{instance=~\"$instance\",code=~\"5..\"}[5m])) / sum(rate(edgeproxy_requests_total{instance=~\"$instance\"}[5m]))" }]
+    },
+    {
+      "id": 3, "type": "stat", "title": "p99 latency",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s", "decimals": 3,
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "orange", "value": 0.25 }, { "color": "red", "value": 0.5 }
+          ] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [{ "refId": "A", "expr": "histogram_quantile(0.99, sum by (le) (rate(edgeproxy_request_duration_seconds_bucket{instance=~\"$instance\"}[5m])))" }]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Healthy backends",
+      "description": "Passing active health checks and not ejected by outlier detection.",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+      "targets": [{ "refId": "A", "expr": "min(sum by (instance) (edgeproxy_backend_up{instance=~\"$instance\"} - edgeproxy_backend_ejected{instance=~\"$instance\"}))" }]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Requests / s by backend",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "stacking": { "mode": "normal" }, "fillOpacity": 20 } }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "sum by (backend) (rate(edgeproxy_requests_total{instance=~\"$instance\"}[1m]))", "legendFormat": "{{backend}}" }]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Responses / s by status",
+      "description": "429 = rate limited, 502 = backend unreachable, 503 = no healthy backend.",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "sum by (code) (rate(edgeproxy_requests_total{instance=~\"$instance\"}[1m]))", "legendFormat": "{{code}}" }]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Latency percentiles",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(edgeproxy_request_duration_seconds_bucket{instance=~\"$instance\"}[1m])))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(edgeproxy_request_duration_seconds_bucket{instance=~\"$instance\"}[1m])))", "legendFormat": "p95" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(edgeproxy_request_duration_seconds_bucket{instance=~\"$instance\"}[1m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "In-flight requests by backend",
+      "description": "One backend far above the rest is slow.",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "sum by (backend) (edgeproxy_backend_inflight_requests{instance=~\"$instance\"})", "legendFormat": "{{backend}}" }]
+    },
+    {
+      "id": 9, "type": "state-timeline", "title": "Backend health",
+      "description": "Up = passing active health checks; ejected = taken out by outlier detection.",
+      "gridPos": { "x": 0, "y": 20, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "type": "value", "options": {
+            "0": { "text": "down", "color": "red" }, "1": { "text": "up", "color": "green" }, "2": { "text": "ejected", "color": "orange" }
+          } }]
+        },
+        "overrides": []
+      },
+      "targets": [{ "refId": "A", "expr": "max by (backend) (edgeproxy_backend_up{instance=~\"$instance\"} + edgeproxy_backend_up{instance=~\"$instance\"} * edgeproxy_backend_ejected{instance=~\"$instance\"})", "legendFormat": "{{backend}}" }]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Retries and outlier ejections",
+      "gridPos": { "x": 12, "y": 20, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(edgeproxy_retries_total{instance=~\"$instance\"}[1m]))", "legendFormat": "retries" },
+        { "refId": "B", "expr": "sum(rate(edgeproxy_retry_budget_exhausted_total{instance=~\"$instance\"}[1m]))", "legendFormat": "retries refused (budget empty)" },
+        { "refId": "C", "expr": "sum by (backend) (rate(edgeproxy_outlier_ejections_total{instance=~\"$instance\"}[5m]))", "legendFormat": "ejections {{backend}}" },
+        { "refId": "D", "expr": "sum(rate(edgeproxy_upstream_errors_total{instance=~\"$instance\"}[1m]))", "legendFormat": "upstream errors" }
+      ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Rate limited (429) by rule",
+      "gridPos": { "x": 0, "y": 28, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "sum by (rule) (rate(edgeproxy_rate_limited_total{instance=~\"$instance\"}[1m]))", "legendFormat": "{{rule}}" }]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Redis fallbacks and config reloads",
+      "description": "Fallbacks above zero mean Redis is unreachable and limits are per instance.",
+      "gridPos": { "x": 12, "y": 28, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(edgeproxy_rate_limit_fallbacks_total{instance=~\"$instance\"}[1m]))", "legendFormat": "Redis fallbacks" },
+        { "refId": "B", "expr": "sum by (result) (increase(edgeproxy_config_reloads_total{instance=~\"$instance\"}[5m]))", "legendFormat": "reloads ({{result}})" }
+      ]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Go runtime: goroutines",
+      "gridPos": { "x": 0, "y": 36, "w": 12, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "go_goroutines{job=\"edgeproxy\",instance=~\"$instance\"}", "legendFormat": "{{instance}}" }]
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Go runtime: heap in use",
+      "gridPos": { "x": 12, "y": 36, "w": 12, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "go_memstats_heap_inuse_bytes{job=\"edgeproxy\",instance=~\"$instance\"}", "legendFormat": "{{instance}}" }]
+    }
+  ]
+}
