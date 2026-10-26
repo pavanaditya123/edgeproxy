@@ -94,7 +94,7 @@ conditions without Lua/`MULTI`, fail-open vs fail-closed, hot keys.
 
 - [x] TLS termination with HTTP/2, TLS 1.2+ minimum, HTTP→HTTPS redirect, and certificate rotation without a restart
 - [x] `DESIGN.md`: architecture, trade-offs, known gaps, what I'd do at 100× scale
-- [x] README rewritten for complete beginners, with 21 diagrams; benchmark and chaos results in [BENCHMARKS.md](BENCHMARKS.md)
+- [x] README rewritten for complete beginners, with 20 diagrams; benchmark and chaos results in [BENCHMARKS.md](BENCHMARKS.md)
 - [x] Resume bullets with real numbers (below)
 - [ ] Grafana screenshot in the README (take one from http://localhost:3000 while `docker compose run --rm k6 run /scripts/load.js` runs)
 
