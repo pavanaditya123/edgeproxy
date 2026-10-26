@@ -39,7 +39,24 @@ type Config struct {
 	Tracing   Tracing `json:"tracing"`
 
 	Discovery Discovery `json:"discovery"`
+
+	TLS TLS `json:"tls"`
 }
+
+// TLS terminates HTTPS on the public listener when cert_file and key_file are
+// set. The files are re-read every reload_interval, so a renewed certificate
+// is picked up without a restart.
+type TLS struct {
+	CertFile string `json:"cert_file"`
+	KeyFile  string `json:"key_file"`
+	// MinVersion is "1.2" (the default) or "1.3".
+	MinVersion string `json:"min_version"`
+	// RedirectListen, if set (e.g. ":80"), serves plain HTTP that redirects to HTTPS.
+	RedirectListen string `json:"redirect_listen"`
+}
+
+// Enabled reports whether HTTPS is configured.
+func (t TLS) Enabled() bool { return t.CertFile != "" }
 
 // Discovery adds backends found through DNS to the static list. Each name is
 // re-resolved every Interval, and every address it returns becomes a backend;
@@ -230,6 +247,7 @@ func Default() *Config {
 			ServiceName: "edgeproxy",
 		},
 		Discovery: Discovery{Interval: Duration(10 * time.Second)},
+		TLS:       TLS{MinVersion: "1.2"},
 	}
 }
 
@@ -355,6 +373,20 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("reload_interval must not be negative"))
 	}
 	errs = append(errs, c.RateLimit.validate()...)
+	if t := c.TLS; (t.CertFile == "") != (t.KeyFile == "") {
+		errs = append(errs, errors.New("tls needs both cert_file and key_file, or neither"))
+	}
+	if t := c.TLS; t.MinVersion != "1.2" && t.MinVersion != "1.3" {
+		errs = append(errs, fmt.Errorf(`tls.min_version %q must be "1.2" or "1.3"`, t.MinVersion))
+	}
+	if t := c.TLS; t.RedirectListen != "" {
+		if !t.Enabled() {
+			errs = append(errs, errors.New("tls.redirect_listen only makes sense with a certificate"))
+		}
+		if t.RedirectListen == c.Listen || t.RedirectListen == c.AdminListen {
+			errs = append(errs, errors.New("tls.redirect_listen must differ from listen and admin_listen"))
+		}
+	}
 	if tr := c.Tracing; tr.Enabled {
 		if tr.Endpoint == "" || tr.ServiceName == "" {
 			errs = append(errs, errors.New("tracing needs an endpoint and a service_name"))

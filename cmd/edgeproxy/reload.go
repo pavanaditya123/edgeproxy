@@ -19,6 +19,7 @@ import (
 	"edgeproxy/internal/metrics"
 	"edgeproxy/internal/proxy"
 	"edgeproxy/internal/ratelimit"
+	"edgeproxy/internal/tlsutil"
 )
 
 // server owns the live config and swaps in a new backend pool on reload.
@@ -27,6 +28,7 @@ type server struct {
 	boot       *config.Config // the config the process started with
 	px         *proxy.Proxy
 	limiter    *ratelimit.Limiter
+	certs      *tlsutil.CertReloader // nil without TLS
 	metrics    *metrics.Metrics
 	logger     *slog.Logger
 
@@ -180,13 +182,30 @@ func (s *server) watch(ctx context.Context, interval, discoveryInterval time.Dur
 			return
 		case <-hup:
 			_ = s.reload(ctx, "SIGHUP")
+			s.reloadCerts()
 		case <-tick:
 			if s.fileChanged() {
 				_ = s.reload(ctx, "file change")
 			}
+			s.reloadCerts()
 		case <-discover.C:
 			s.rediscover(ctx)
 		}
+	}
+}
+
+// reloadCerts picks up a renewed TLS certificate. A broken new certificate is
+// logged and the current one keeps being served.
+func (s *server) reloadCerts() {
+	if s.certs == nil {
+		return
+	}
+	changed, err := s.certs.Reload()
+	switch {
+	case err != nil:
+		s.logger.Error("TLS certificate reload failed; still serving the previous certificate", "error", err)
+	case changed:
+		s.logger.Info("TLS certificate reloaded")
 	}
 }
 
@@ -221,5 +240,6 @@ func restartOnlyChanges(boot, next *config.Config) []string {
 	check("access_log", boot.AccessLog, next.AccessLog)
 	check("tracing", boot.Tracing, next.Tracing)
 	check("discovery.interval", boot.Discovery.Interval, next.Discovery.Interval)
+	check("tls", boot.TLS, next.TLS)
 	return fields
 }

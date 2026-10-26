@@ -8,9 +8,11 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -19,13 +21,23 @@ import (
 	"edgeproxy/internal/metrics"
 	"edgeproxy/internal/observe"
 	"edgeproxy/internal/proxy"
+	"edgeproxy/internal/tlsutil"
 )
 
 func main() {
 	configPath := flag.String("config", "configs/local.json", "path to the JSON config file")
 	check := flag.Bool("check", false, "validate the config file and exit (like nginx -t)")
+	genCert := flag.String("gen-cert", "", "write a self-signed localhost certificate (tls.crt, tls.key) into this directory and exit; for local testing only")
 	flag.Parse()
 
+	if *genCert != "" {
+		if err := writeSelfSigned(*genCert); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("wrote %s and %s\n", filepath.Join(*genCert, "tls.crt"), filepath.Join(*genCert, "tls.key"))
+		return
+	}
 	if *check {
 		if _, err := config.Load(*configPath); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -86,7 +98,14 @@ func run(configPath string, logger *slog.Logger) error {
 		logger.Info("tracing enabled", "endpoint", tr.Endpoint, "sample_ratio", tr.SampleRatio)
 	}
 
-	srv := &server{configPath: configPath, boot: cfg, px: px, limiter: limiter, metrics: m, logger: logger, lastConfigSum: sha256.Sum256(data)}
+	var certs *tlsutil.CertReloader
+	if cfg.TLS.Enabled() {
+		if certs, err = tlsutil.NewCertReloader(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil {
+			return err
+		}
+	}
+
+	srv := &server{configPath: configPath, boot: cfg, px: px, limiter: limiter, certs: certs, metrics: m, logger: logger, lastConfigSum: sha256.Sum256(data)}
 	// The first apply probes every backend before the listener opens, so the
 	// first requests don't hit dead backends.
 	if err := srv.apply(ctx, cfg); err != nil {
@@ -96,6 +115,7 @@ func run(configPath string, logger *slog.Logger) error {
 
 	var draining atomic.Bool
 	admin := newAdminServer(cfg.AdminListen, m, px.Backends, &draining, func() error {
+		srv.reloadCerts()
 		return srv.reload(ctx, "admin API")
 	})
 	// Outermost first: every request gets an ID, then a trace span, then an
@@ -116,12 +136,26 @@ func run(configPath string, logger *slog.Logger) error {
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}
+	servers := []*http.Server{admin, public}
+	if certs != nil {
+		public.TLSConfig = tlsutil.ServerConfig(certs, cfg.TLS.MinVersion)
+		if cfg.TLS.RedirectListen != "" {
+			_, httpsPort, _ := net.SplitHostPort(cfg.Listen)
+			servers = append(servers, &http.Server{
+				Addr:              cfg.TLS.RedirectListen,
+				Handler:           tlsutil.RedirectToHTTPS(httpsPort),
+				ReadHeaderTimeout: cfg.Timeouts.ReadHeader.Std(),
+			})
+		}
+	}
 
-	errc := make(chan error, 2)
-	go func() { errc <- serve(admin) }()
-	go func() { errc <- serve(public) }()
+	errc := make(chan error, len(servers))
+	for _, s := range servers {
+		go func() { errc <- serve(s) }()
+	}
 	logger.Info("edgeproxy started",
-		"listen", cfg.Listen, "admin", cfg.AdminListen, "strategy", cfg.Strategy, "backends", len(px.Backends()))
+		"listen", cfg.Listen, "admin", cfg.AdminListen, "tls", certs != nil,
+		"strategy", cfg.Strategy, "backends", len(px.Backends()))
 
 	select {
 	case err := <-errc:
@@ -139,12 +173,36 @@ func run(configPath string, logger *slog.Logger) error {
 	logger.Info("shutting down", "grace", cfg.Timeouts.ShutdownGrace.Std().String())
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeouts.ShutdownGrace.Std())
 	defer cancel()
-	return errors.Join(public.Shutdown(shutdownCtx), admin.Shutdown(shutdownCtx))
+	var errs []error
+	for _, s := range servers {
+		errs = append(errs, s.Shutdown(shutdownCtx))
+	}
+	return errors.Join(errs...)
 }
 
 func serve(s *http.Server) error {
-	if err := s.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+	var err error
+	if s.TLSConfig != nil {
+		err = s.ListenAndServeTLS("", "") // the certificate comes from TLSConfig.GetCertificate
+	} else {
+		err = s.ListenAndServe()
+	}
+	if !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("serve %s: %w", s.Addr, err)
 	}
 	return nil
+}
+
+func writeSelfSigned(dir string) error {
+	certPEM, keyPEM, err := tlsutil.SelfSigned("localhost")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tls.crt"), certPEM, 0o644); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "tls.key"), keyPEM, 0o600)
 }
