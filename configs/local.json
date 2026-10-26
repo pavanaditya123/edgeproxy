@@ -1,0 +1,27 @@
+{
+  "listen": ":8080",
+  "admin_listen": ":9090",
+  "strategy": "round_robin",
+  "hash_key": "header:X-User-ID",
+  "max_retries": 2,
+  "backends": [
+    "http://127.0.0.1:9001",
+    "http://127.0.0.1:9002",
+    "http://127.0.0.1:9003"
+  ],
+  "health_check": {
+    "path": "/healthz",
+    "interval": "2s",
+    "timeout": "500ms",
+    "healthy_threshold": 2,
+    "unhealthy_threshold": 2
+  },
+  "timeouts": {
+    "dial": "1s",
+    "read_header": "5s",
+    "response_header": "10s",
+    "idle_conn": "90s",
+    "drain_delay": "0s",
+    "shutdown_grace": "15s"
+  }
+}
