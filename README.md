@@ -31,7 +31,7 @@ configs/local.json   config for local runs
 
 ## Run it locally
 
-Requires Go 1.22+. Fetch dependencies and run the tests:
+Requires Go 1.26+. Fetch dependencies and run the tests:
 
 ```bash
 go mod tidy
