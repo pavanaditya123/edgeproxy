@@ -137,13 +137,87 @@ func TestConsistentHashMovesOnlyFailedBackendsKeys(t *testing.T) {
 	}
 }
 
+func TestP2CPicksTheLessLoadedOfTwo(t *testing.T) {
+	bs := newBackends(t, 2)
+	bs[0].Acquire()
+	bs[0].Acquire()
+	p := NewP2C(bs)
+	for i := 0; i < 50; i++ {
+		if got := p.Next(nil, alive); got != bs[1] {
+			t.Fatalf("picked %s, want the idle backend", got.Name())
+		}
+	}
+}
+
+func TestP2CNeverPicksIneligible(t *testing.T) {
+	bs := newBackends(t, 5)
+	bs[1].SetAlive(false)
+	bs[3].SetAlive(false)
+	p := NewP2C(bs)
+	seen := map[*backend.Backend]bool{}
+	for i := 0; i < 500; i++ {
+		got := p.Next(nil, alive)
+		if !got.Alive() {
+			t.Fatalf("picked dead backend %s", got.Name())
+		}
+		seen[got] = true
+	}
+	if len(seen) != 3 {
+		t.Errorf("used %d backends, want all 3 live ones", len(seen))
+	}
+}
+
+func TestP2CWithOneEligibleBackend(t *testing.T) {
+	bs := newBackends(t, 4)
+	for _, b := range bs[1:] {
+		b.SetAlive(false)
+	}
+	p := NewP2C(bs)
+	for i := 0; i < 50; i++ {
+		if got := p.Next(nil, alive); got != bs[0] {
+			t.Fatalf("picked %v, want the only live backend", got)
+		}
+	}
+}
+
+func TestWeightedRoundRobinIsSmooth(t *testing.T) {
+	bs := newBackends(t, 3)
+	bs[0].SetWeight(5)
+	w := NewWeightedRoundRobin(bs)
+	// The sequence nginx documents for weights 5, 1, 1.
+	want := []*backend.Backend{bs[0], bs[0], bs[1], bs[0], bs[2], bs[0], bs[0]}
+	for cycle := 0; cycle < 3; cycle++ {
+		for i, exp := range want {
+			if got := w.Next(nil, alive); got != exp {
+				t.Fatalf("cycle %d pick %d = %s, want %s", cycle, i, got.Name(), exp.Name())
+			}
+		}
+	}
+}
+
+func TestWeightedRoundRobinSkipsDeadBackends(t *testing.T) {
+	bs := newBackends(t, 3)
+	bs[0].SetWeight(3)
+	bs[0].SetAlive(false)
+	w := NewWeightedRoundRobin(bs)
+	counts := map[*backend.Backend]int{}
+	for i := 0; i < 100; i++ {
+		counts[w.Next(nil, alive)]++
+	}
+	if counts[bs[0]] != 0 || counts[bs[1]] != 50 || counts[bs[2]] != 50 {
+		t.Errorf("got %v; want the two live weight-1 backends to split evenly", counts)
+	}
+}
+
 func TestBalancersReturnNilWhenNothingEligible(t *testing.T) {
 	bs := newBackends(t, 3)
 	none := func(*backend.Backend) bool { return false }
 	bals := map[string]Balancer{
-		"round_robin":     NewRoundRobin(bs),
-		"least_conn":      NewLeastConn(bs),
-		"consistent_hash": newUserHash(t, bs),
+		"round_robin":          NewRoundRobin(bs),
+		"weighted_round_robin": NewWeightedRoundRobin(bs),
+		"least_conn":           NewLeastConn(bs),
+		"p2c":                  NewP2C(bs),
+		"consistent_hash":      newUserHash(t, bs),
 	}
 	for name, bal := range bals {
 		if got := bal.Next(userRequest(1), none); got != nil {

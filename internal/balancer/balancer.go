@@ -23,8 +23,12 @@ func New(strategy, hashKey string, backends []*backend.Backend) (Balancer, error
 	switch strategy {
 	case "round_robin":
 		return NewRoundRobin(backends), nil
+	case "weighted_round_robin":
+		return NewWeightedRoundRobin(backends), nil
 	case "least_conn":
 		return NewLeastConn(backends), nil
+	case "p2c":
+		return NewP2C(backends), nil
 	case "consistent_hash":
 		keyFn, err := KeyFunc(hashKey)
 		if err != nil {

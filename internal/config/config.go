@@ -11,14 +11,14 @@ import (
 )
 
 type Config struct {
-	Listen      string      `json:"listen"`
-	AdminListen string      `json:"admin_listen"`
-	Strategy    string      `json:"strategy"`
-	HashKey     string      `json:"hash_key"`
-	MaxRetries  int         `json:"max_retries"`
-	Backends    []string    `json:"backends"`
-	HealthCheck HealthCheck `json:"health_check"`
-	Timeouts    Timeouts    `json:"timeouts"`
+	Listen      string        `json:"listen"`
+	AdminListen string        `json:"admin_listen"`
+	Strategy    string        `json:"strategy"`
+	HashKey     string        `json:"hash_key"`
+	MaxRetries  int           `json:"max_retries"`
+	Backends    []BackendSpec `json:"backends"`
+	HealthCheck HealthCheck   `json:"health_check"`
+	Timeouts    Timeouts      `json:"timeouts"`
 
 	// MaxInflightPerBackend caps concurrent requests to any one backend; 0 means no cap.
 	MaxInflightPerBackend int              `json:"max_inflight_per_backend"`
@@ -31,6 +31,33 @@ type Config struct {
 type RetryBudget struct {
 	Ratio               float64 `json:"ratio"`
 	MinRetriesPerSecond int     `json:"min_retries_per_second"`
+}
+
+// BackendSpec is one entry in "backends": either a URL string, or an object
+// such as {"url": "http://10.0.0.1:8080", "weight": 3}.
+type BackendSpec struct {
+	URL    string `json:"url"`
+	Weight int    `json:"weight,omitempty"`
+}
+
+func (b *BackendSpec) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*b = BackendSpec{URL: s, Weight: 1}
+		return nil
+	}
+	type plain BackendSpec // no UnmarshalJSON method, so no recursion
+	var p plain
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&p); err != nil {
+		return fmt.Errorf(`backend must be a URL string or {"url": ..., "weight": ...}: %w`, err)
+	}
+	if p.Weight == 0 {
+		p.Weight = 1
+	}
+	*b = BackendSpec(p)
+	return nil
 }
 
 // OutlierDetection configures passive health checking (see package outlier).
@@ -151,9 +178,9 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("listen and admin_listen must differ"))
 	}
 	switch c.Strategy {
-	case "round_robin", "least_conn", "consistent_hash":
+	case "round_robin", "weighted_round_robin", "least_conn", "p2c", "consistent_hash":
 	default:
-		errs = append(errs, fmt.Errorf("strategy %q must be round_robin, least_conn or consistent_hash", c.Strategy))
+		errs = append(errs, fmt.Errorf("strategy %q must be round_robin, weighted_round_robin, least_conn, p2c or consistent_hash", c.Strategy))
 	}
 	if c.MaxRetries < 0 || c.MaxRetries > 10 {
 		errs = append(errs, fmt.Errorf("max_retries %d must be between 0 and 10", c.MaxRetries))
@@ -163,10 +190,16 @@ func (c *Config) Validate() error {
 	}
 	seen := make(map[string]bool, len(c.Backends))
 	for _, b := range c.Backends {
-		if seen[b] {
-			errs = append(errs, fmt.Errorf("backend %q is listed twice", b))
+		if b.URL == "" {
+			errs = append(errs, errors.New("every backend needs a url"))
 		}
-		seen[b] = true
+		if seen[b.URL] {
+			errs = append(errs, fmt.Errorf("backend %q is listed twice", b.URL))
+		}
+		seen[b.URL] = true
+		if b.Weight < 1 || b.Weight > 1000 {
+			errs = append(errs, fmt.Errorf("backend %q: weight %d must be between 1 and 1000", b.URL, b.Weight))
+		}
 	}
 
 	hc := c.HealthCheck

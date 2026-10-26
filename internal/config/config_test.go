@@ -33,6 +33,26 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	}
 }
 
+func TestBackendsAcceptStringsAndObjects(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{"backends": ["http://a:1", {"url": "http://b:2", "weight": 3}, {"url": "http://c:3"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []BackendSpec{{"http://a:1", 1}, {"http://b:2", 3}, {"http://c:3", 1}}
+	for i, w := range want {
+		if cfg.Backends[i] != w {
+			t.Errorf("backend %d = %+v, want %+v", i, cfg.Backends[i], w)
+		}
+	}
+}
+
+func TestBackendObjectRejectsUnknownFields(t *testing.T) {
+	_, err := Load(writeConfig(t, `{"backends": [{"url": "http://b:2", "wieght": 3}]}`))
+	if err == nil || !strings.Contains(err.Error(), "wieght") {
+		t.Fatalf("err = %v, want it to name the misspelled field", err)
+	}
+}
+
 func TestLoadRejectsUnknownFields(t *testing.T) {
 	_, err := Load(writeConfig(t, `{"backends": ["http://127.0.0.1:9001"], "max_retires": 3}`))
 	if err == nil || !strings.Contains(err.Error(), "max_retires") {

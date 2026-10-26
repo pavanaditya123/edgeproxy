@@ -211,6 +211,60 @@ func TestLeastConnSendsLessTrafficToSlowBackend(t *testing.T) {
 	}
 }
 
+func TestWeightedRoundRobinFollowsWeights(t *testing.T) {
+	big, small := startBackend(t, "big"), startBackend(t, "small")
+	ep := startProxy(t, proxyOpts{
+		strategy: "weighted_round_robin",
+		extra: map[string]any{"backends": []any{
+			map[string]any{"url": big.url, "weight": 3},
+			small.url,
+		}},
+	}, big, small)
+
+	counts := map[string]int{}
+	for i := 0; i < 40; i++ {
+		counts[ep.whoAnswers(t, nil)]++
+	}
+	if counts["big"] != 30 || counts["small"] != 10 {
+		t.Errorf("got %v, want big:30 small:10 for weights 3:1", counts)
+	}
+	if w := ep.status(t, big).Weight; w != 3 {
+		t.Errorf("/backends reports weight %d for big, want 3", w)
+	}
+}
+
+func TestP2CSendsLessTrafficToSlowBackend(t *testing.T) {
+	a := startBackend(t, "a")
+	slow := startBackend(t, "slow", "-latency", "300ms")
+	c := startBackend(t, "c")
+	ep := startProxy(t, proxyOpts{strategy: "p2c"}, a, slow, c)
+
+	const workers, perWorker = 6, 15
+	var mu sync.Mutex
+	counts := map[string]int{}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				code, e, err := ep.fetch(http.MethodGet, "/", nil, "")
+				if err != nil || code != http.StatusOK {
+					t.Errorf("GET: %d, %v", code, err)
+					return
+				}
+				mu.Lock()
+				counts[e.Backend]++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if share := float64(counts["slow"]) / (workers * perWorker); share > 0.2 {
+		t.Errorf("slow backend served %.0f%% of requests, want under 20%% (counts: %v)", share*100, counts)
+	}
+}
+
 func TestGracefulShutdownFinishesInflightRequests(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("needs SIGTERM, which Windows cannot deliver to another process")

@@ -14,14 +14,15 @@ func buildBackends(cfg *config.Config, prev []*backend.Backend) ([]*backend.Back
 		existing[b.URL.String()] = b
 	}
 	backends := make([]*backend.Backend, 0, len(cfg.Backends))
-	for _, raw := range cfg.Backends {
-		b, err := backend.New(raw)
+	for _, spec := range cfg.Backends {
+		b, err := backend.New(spec.URL)
 		if err != nil {
 			return nil, err
 		}
 		if old, ok := existing[b.URL.String()]; ok {
 			b = old
 		}
+		b.SetWeight(spec.Weight)
 		b.SetMaxInflight(cfg.MaxInflightPerBackend)
 		backends = append(backends, b)
 	}
