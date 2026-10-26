@@ -42,6 +42,14 @@ jobs:
       - name: Vet (including end-to-end tests)
         run: go vet -tags e2e ./...
 
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2026.2.2 -tags e2e ./...
+
+      # Fails if a known vulnerability is reachable from our code, in the
+      # standard library or any dependency.
+      - name: Vulnerability check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
       - name: Build
         run: go build ./...
 
@@ -85,6 +93,41 @@ jobs:
           name: fuzz-corpus
           path: internal/config/testdata/fuzz
 
+  deploy-configs:
+    name: Deploy configs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Prometheus alert rules (syntax and unit tests)
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/rules" -w /rules --entrypoint promtool \
+            prom/prometheus:v3.15.1 check rules alerts.yml
+          docker run --rm -v "$PWD/deploy/prometheus:/rules" -w /rules --entrypoint promtool \
+            prom/prometheus:v3.15.1 test rules alerts_test.yml
+
+      - name: Kubernetes manifests (schema)
+        run: |
+          docker run --rm -v "$PWD/deploy/k8s:/k8s" ghcr.io/yannh/kubeconform:v0.8.0 \
+            -strict -summary -ignore-filename-pattern kustomization /k8s
+
+      - name: Every shipped edgeproxy config is valid
+        run: |
+          python3 -c "import yaml; d=[x for x in yaml.safe_load_all(open('deploy/k8s/edgeproxy.yaml')) if x['kind']=='ConfigMap'][0]; open('/tmp/k8s.json','w').write(d['data']['config.json'])"
+          for f in configs/*.json deploy/compose/edgeproxy.json /tmp/k8s.json; do
+            go run ./cmd/edgeproxy -check -config "$f"
+          done
+
+      - name: Compose file and Grafana dashboard
+        run: |
+          docker compose config --quiet
+          python3 -m json.tool deploy/grafana/dashboards/edgeproxy.json > /dev/null
+
   e2e:
     name: End-to-end tests
     needs: [lint, unit]
@@ -110,9 +153,56 @@ jobs:
 
       # Builds edgeproxy and demobackend (with the race detector), runs them as
       # real processes and checks load balancing, health checks, retries,
-      # rate limiting, config reload and graceful shutdown over real HTTP.
+      # rate limiting, config reload, discovery and graceful shutdown.
       - name: Run end-to-end tests
         env:
           E2E_RACE: "1"
           E2E_REDIS_ADDR: localhost:6379
         run: go test -tags e2e -count=1 -v ./e2e/
+
+  system:
+    name: Load and chaos tests
+    needs: [e2e, deploy-configs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # Builds the real Docker images and starts the whole stack: two proxies,
+      # Redis, three backends, Toxiproxy, Prometheus, Grafana, Jaeger.
+      - name: Start the stack
+        run: |
+          docker compose up -d --build --wait-timeout 120
+          for i in $(seq 60); do
+            if curl -fs localhost:9090/readyz && curl -fs localhost:9091/readyz; then break; fi
+            sleep 2
+          done
+          docker compose ps
+
+      - name: Load test (1,000 req/s for 30s, under 0.1% errors and 250ms p99)
+        run: docker compose run --rm -T -e RATE=1000 -e DURATION=30s -e LABEL=load k6 run --quiet /scripts/load.js
+
+      - name: Chaos test (kill a backend, slow one down, stop Redis, all under load)
+        run: RATE=500 scripts/chaos.sh
+
+      - name: Results summary
+        if: always()
+        run: |
+          {
+            echo "### Load and chaos results"
+            echo '| Run | req/s | Errors | p50 ms | p99 ms |'
+            echo '|---|---|---|---|---|'
+            for f in loadtest/results/load.json loadtest/results/chaos.json; do
+              [ -f "$f" ] && jq -r '"| \(.label) | \(.rps) | \(.error_rate * 100)% | \(.p50_ms | . * 100 | round / 100) | \(.p99_ms | . * 100 | round / 100) |"' "$f"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Proxy logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 200 edgeproxy-1 edgeproxy-2
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: load-test-results
+          path: loadtest/results
