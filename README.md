@@ -1,33 +1,186 @@
 # edgeproxy
 
-**edgeproxy is a load balancer.** It sits in front of several copies of a web
-server and decides which copy handles each incoming request. If a copy
-crashes, slows down or starts returning errors, users don't notice: edgeproxy
-steers around it, retries safely, and keeps abusive clients in check with
-rate limits.
+**In one sentence:** edgeproxy is a smart front door for an app's servers.
+Every user's request comes to it first, and it sends each one to a server
+that is free and working, so the app stays fast and keeps running even when
+a server breaks.
 
-It's written in Go and built the way real production load balancers (Nginx,
+---
+
+## Start here (no experience needed)
+
+This part uses no technical word without explaining it. If you have ever used
+an app or a website, you can follow it.
+
+### What is a "backend"?
+
+When you open an app, say a food-delivery app, two parts are working:
+
+- The **frontend** is what you see and tap: the buttons, the pictures, the menu.
+- The **backend** is a program running on a computer somewhere else, called a
+  **server**. It does the real work: it checks your password, finds
+  restaurants near you, and saves your order.
+
+Every time you tap something, your phone sends a small message to the backend
+asking for something. That message is a **request**. The backend sends back an
+answer, called a **response**.
+
+```
+ You tap "Show restaurants"   ──── request ────►   backend (the server)
+ You see the list             ◄─── response ────   backend
+```
+
+### The problem
+
+A new app usually has **one** backend server. That works for 10 users. But:
+
+- When **10,000 people** tap at the same moment, one server gets **too busy**, and the app becomes slow for everyone.
+- If that one server **crashes**, the app stops working for **everyone**.
+
+### The fix: several copies, and a smart front door
+
+Run several identical copies of the backend. Now someone has to decide which
+copy answers each request. **That is edgeproxy's job.** It stands at the front
+door: every request comes to it first, and it passes each one to a copy that is
+free and working.
+
+```mermaid
+flowchart TB
+    subgraph ONE["Before: one server"]
+        direction TB
+        U1["User 1"] --> S1["The only server"]
+        U2["User 2"] --> S1
+        U3["User 3"] --> S1
+        S1 --> X1["Too busy, so slow.<br/>If it breaks, nobody<br/>can use the app"]
+    end
+    subgraph MANY["After: copies plus edgeproxy"]
+        direction TB
+        V1["User 1"] --> LB["edgeproxy<br/>the smart front door"]
+        V2["User 2"] --> LB
+        V3["User 3"] --> LB
+        LB --> SA["Copy 1"]
+        LB --> SB["Copy 2"]
+        LB --> SC["Copy 3, broken"]
+        SC --> X2["edgeproxy simply stops<br/>sending work to it.<br/>Users notice nothing"]
+    end
+    ONE ~~~ MANY
+```
+
+Users never know there are copies, and they never know one broke.
+
+A program that does this is called a **load balancer**: "load" means work, and
+a "balancer" shares it out evenly. Google, Amazon and Netflix all run load
+balancers in front of their servers. edgeproxy is a small but real one.
+
+### The 8 jobs edgeproxy does
+
+Think of a bank. edgeproxy is the **manager at the front desk**, and the
+backend copies are the **tellers** (the bank staff behind the counters).
+
+| # | Job | In the bank | In edgeproxy |
+|---|---|---|---|
+| 1 | **Share the work** | Sends each customer to a teller who isn't busy | Sends each request to a backend copy. It knows 5 different ways to choose. |
+| 2 | **Check everyone is OK** | Every few seconds, checks that each teller is at their desk | Every few seconds, asks each copy "are you OK?". It stops using any copy that doesn't answer. |
+| 3 | **Bench a struggling worker** | A teller who keeps making mistakes is sent on a short break, then given one customer to see if they're better | A copy that keeps giving error answers gets no work for a while, then is tested with one request |
+| 4 | **Try again, but only when it's safe** | If a teller suddenly faints, the customer is taken to another teller. But only for safe things like "check my balance", never "send money", which could then happen twice. | If a copy suddenly stops answering, the request is sent to another copy, but only if doing it twice can't cause harm |
+| 5 | **Stop one person hogging everything** | "Each customer may visit at most 5 times a minute" | **Rate limiting:** a user who sends too many requests is told "slow down, try again in a few seconds" |
+| 6 | **Give every visit a ticket number** | The number is written on every form the customer touches | Every request gets an ID, so you can later find out exactly what happened to it |
+| 7 | **Keep a scoreboard** | A board showing customers served and waiting times | Live charts: how many requests, how fast, how many errors |
+| 8 | **Change plans without closing** | Opens a new counter while the bank stays open. At closing time, puts up a "closed" sign but still serves everyone already inside. | Settings can change while it runs. When it's shut down, it first finishes every request in progress. |
+
+It also **locks the door**: it can talk to users over **HTTPS** (the padlock
+in your browser's address bar), so nobody in between can read their data.
+
+### One request's journey
+
+1. You tap a button. Your phone sends a request to edgeproxy.
+2. edgeproxy gives the request a ticket number and notes the time.
+3. It checks that you haven't sent too many requests in the last few seconds.
+4. It picks a backend copy that is working and not too busy.
+5. It passes your request to that copy. If that copy suddenly stops answering, and repeating the request is safe, it quickly tries another copy.
+6. The answer comes back to you. edgeproxy writes one line in its diary (called a **log**): your ticket number, which copy answered, and how long it took.
+
+edgeproxy's own part of this usually takes about **1 to 2 milliseconds**
+(thousandths of a second).
+
+### How do we know it really works?
+
+Claims are easy; proof is better. Every time the code changes, GitHub's
+computers automatically:
+
+1. Run **91 automatic tests**, small programs that check each part does exactly what it should.
+2. Start the real edgeproxy and real backend copies, and send them real requests.
+3. Send **1,000 requests every second** for 30 seconds and measure the speed.
+4. Then **break things on purpose** while it's busy: switch off one backend copy, make another one very slow, and unplug the database it uses for rate limits.
+
+Result: out of **30,001 requests** sent while things were breaking, **not a
+single one failed.** Users would have noticed nothing.
+
+### Can I use it with my own app?
+
+Yes. If you build a full-stack app (a frontend plus a backend), edgeproxy goes
+between them:
+
+```mermaid
+flowchart LR
+    F["Your frontend<br/>React, Angular,<br/>or a mobile app"] -->|"requests"| E["edgeproxy"]
+    E --> B1["Your backend, copy 1<br/>Node, Python, Java, Go..."]
+    E --> B2["Your backend, copy 2"]
+    B1 --> DB[("Your database")]
+    B2 --> DB
+```
+
+1. Your frontend sends its requests to edgeproxy's address instead of straight to the backend.
+2. You run two or more copies of your backend, and list their addresses in edgeproxy's settings file.
+3. Your backend should give the same answer whichever copy handles a request. So keep users, logins and shopping carts in the **database** (or Redis), not in one server's memory. A backend built this way is called **stateless**.
+4. Give your backend a `/healthz` page that just answers "ok", so edgeproxy can check it's alive.
+
+Your frontend and backend code don't need to know edgeproxy exists.
+
+**Is edgeproxy a microservice?** A **microservice** is one small program that
+does one job and talks to other programs over the network. Big apps are often
+split into many of them: a users service, an orders service, a payments
+service. edgeproxy is a separate program like that, and its one job is
+sitting in front of the others. Programs with this role are called **reverse
+proxies** or, when they also check things like rate limits, **API gateways**.
+Right now edgeproxy sends every request to one group of copies. Sending
+`/users` to one group and `/orders` to another is the natural next feature
+([DESIGN.md](DESIGN.md) explains how).
+
+### Where to go next
+
+| If you are... | Read |
+|---|---|
+| New to backend | Keep reading this file in order. Every technical word is explained in [section 2](#2-words-you-need-first). |
+| Preparing for interviews | [DESIGN.md](DESIGN.md) (why each decision was made) and [BENCHMARKS.md](BENCHMARKS.md) (the measured numbers) |
+| Wanting to run it yourself | [Section 15](#15-run-it) |
+| Curious how it was built, step by step | [PLAN.md](PLAN.md) |
+
+---
+
+## For engineers: what's inside
+
+A Layer-7 HTTP load balancer in Go, built the way production ones (Nginx,
 Envoy, AWS ALB) work, at a size you can read in a weekend:
 
-- **5 balancing strategies:** round robin, weighted round robin, least connections, power of two choices, consistent hashing
-- **Two kinds of health checking:** active probes plus passive "circuit breakers"
-- **Safe retries** with a retry budget, so a failure can't snowball
-- **Rate limiting** shared across every proxy through Redis, with a fallback when Redis is down
-- **Observability:** Prometheus metrics, JSON access logs, OpenTelemetry tracing, a Grafana dashboard and SLO alerts
-- **Operations:** hot config reload, DNS service discovery, TLS with HTTP/2 and certificate rotation, graceful shutdown
-- **Proof:** unit, fuzz, end-to-end, load and chaos tests, all in CI
+- **5 balancing strategies:** round robin, smooth weighted round robin, least connections, power of two choices, consistent hashing
+- **Two kinds of health checking:** active probes plus passive circuit breakers (outlier detection)
+- **Safe retries** for idempotent requests only, capped by a retry budget
+- **Rate limiting** shared across every proxy through Redis (atomic Lua sliding window), falling back to local token buckets when Redis is down
+- **Observability:** Prometheus metrics, JSON access logs, request IDs, OpenTelemetry tracing, a Grafana dashboard and SLO burn-rate alerts
+- **Operations:** hot config reload, DNS service discovery, TLS with HTTP/2 and certificate rotation, graceful shutdown, Docker and Kubernetes manifests
+- **Proof:** unit, fuzz, end-to-end, load and chaos tests, all in CI with the race detector
 
 Measured on a laptop: **3,000 req/s at 1.4 ms p50 / ~6 ms p99**, and **zero
-failed requests out of 30,001** while a backend was killed, another was slowed
-by 500 ms and Redis was stopped, all mid-load. See [BENCHMARKS.md](BENCHMARKS.md).
-For the design trade-offs, see [DESIGN.md](DESIGN.md); for how it was built
-step by step, [PLAN.md](PLAN.md).
+failed requests out of 30,001** while a backend was killed, another slowed by
+500 ms and Redis stopped, all mid-load ([BENCHMARKS.md](BENCHMARKS.md)).
 
 ---
 
 ## Contents
 
-1. [The 30-second version (a bank analogy)](#1-the-30-second-version-a-bank-analogy)
+0. [Start here (no experience needed)](#start-here-no-experience-needed)
+1. [The bank analogy, in detail](#1-the-bank-analogy-in-detail)
 2. [Words you need first](#2-words-you-need-first)
 3. [The whole system in one picture](#3-the-whole-system-in-one-picture)
 4. [What happens to every request, layer by layer](#4-what-happens-to-every-request-layer-by-layer)
@@ -48,43 +201,9 @@ step by step, [PLAN.md](PLAN.md).
 
 ---
 
-## 1. The 30-second version (a bank analogy)
+## 1. The bank analogy, in detail
 
-### The problem this solves
-
-A website usually starts as **one server**: one program on one machine that
-answers every user. That breaks in two ways: too many users overload it, and
-if it crashes, *everyone* sees an error.
-
-```mermaid
-flowchart TB
-    subgraph ONE["Without a load balancer"]
-        direction TB
-        U1["User 1"] --> S1["The only server"]
-        U2["User 2"] --> S1
-        U3["User 3"] --> S1
-        U4["User 4"] --> S1
-        S1 --> X1["Overloaded, slow.<br/>If it crashes, every user gets an error"]
-    end
-    subgraph MANY["With edgeproxy"]
-        direction TB
-        V1["User 1"] --> LB["edgeproxy"]
-        V2["User 2"] --> LB
-        V3["User 3"] --> LB
-        V4["User 4"] --> LB
-        LB --> SA["Server A"]
-        LB --> SB["Server B"]
-        LB --> SC["Server C, crashed"]
-        SC --> X2["edgeproxy stops using C.<br/>Users never notice"]
-    end
-    ONE ~~~ MANY
-```
-
-The fix is to run **several identical copies** of the server and put
-edgeproxy in front of them. Users only ever talk to edgeproxy, which shares the
-work out and steers around any copy that breaks.
-
-### The same idea, as a bank
+Start here compared edgeproxy to a bank in 8 jobs. Here is the full comparison, with the real technical name for each idea, so you can match the story to the terms used in the rest of this page.
 
 Picture a bank branch with one **front desk** and several **tellers**.
 
@@ -111,6 +230,8 @@ Keep this picture in mind; every section below is one row of this table in more 
 ---
 
 ## 2. Words you need first
+
+> **In plain words:** Every technical word used later, explained in everyday language. Skim it now, or come back whenever a word is new.
 
 Each term is used later in this README and in the code.
 
@@ -274,6 +395,8 @@ Go's default pool keeps only **2** idle connections per backend, so under load m
 
 ## 3. The whole system in one picture
 
+> **In plain words:** A map of every part inside edgeproxy and how the parts connect.
+
 ```mermaid
 flowchart TB
     CL["Client<br/>browser, app, curl"] -->|"1. HTTP or HTTPS"| PUB
@@ -309,6 +432,8 @@ flowchart TB
 
 ## 4. What happens to every request, layer by layer
 
+> **In plain words:** Before passing a request on, edgeproxy does four quick checks, a bit like the checks at an airport.
+
 Before a request is forwarded it passes through four middleware layers, like
 going through the checks at an airport. Each does one job and passes the
 request inward; the response travels back out through the same layers.
@@ -332,6 +457,8 @@ and logging and tracing sit outside the rate limiter so that even rejected
 ---
 
 ## 5. Life of a request when a backend has just crashed
+
+> **In plain words:** What happens, step by step, when one of the copies has just crashed.
 
 Backend A has just crashed, and the health checker hasn't noticed yet.
 
@@ -371,6 +498,8 @@ The access log line and the trace both record: backend B, 2 attempts, status 200
 
 ## 6. When does it retry? (and the retry budget)
 
+> **In plain words:** edgeproxy only re-sends a request when repeating it is harmless, and never so often that it makes things worse.
+
 ```mermaid
 flowchart TD
     S(["Request arrives"]) --> R{"Is it GET, HEAD or OPTIONS<br/>with no body?"}
@@ -408,6 +537,8 @@ flowchart TD
 ---
 
 ## 7. How a backend is chosen (5 strategies)
+
+> **In plain words:** Five different rules edgeproxy can use to decide which copy gets the next request.
 
 Set with `"strategy"` in the config. Every strategy skips backends that are unhealthy, ejected, at capacity, or already tried for this request.
 
@@ -492,6 +623,8 @@ flowchart TB
 
 ## 8. Health checking: active probes and circuit breakers
 
+> **In plain words:** Two ways of spotting a broken copy: asking it how it is, and watching how it behaves.
+
 edgeproxy finds broken backends two ways, because each catches failures the other misses.
 
 | | **Active** health checks | **Passive** health checks (outlier detection) |
@@ -539,6 +672,8 @@ stateDiagram-v2
 ---
 
 ## 9. Rate limiting
+
+> **In plain words:** How edgeproxy stops any one user from sending too many requests.
 
 A rate limit caps how many requests one client may send. It protects your
 servers from abusive or buggy clients, and expensive endpoints (like login)
@@ -621,6 +756,8 @@ requests failed.
 
 ## 10. Changing config without a restart
 
+> **In plain words:** How you can change edgeproxy's settings while it keeps running.
+
 Edit the config file and edgeproxy notices within `reload_interval` (2 s);
 or send `SIGHUP`; or `POST /-/reload` on the admin port.
 
@@ -659,6 +796,8 @@ emptying the pool.
 ---
 
 ## 11. Seeing inside: metrics, logs and traces
+
+> **In plain words:** How you can see what edgeproxy is doing: live charts, a diary of every request, and a timeline of each request's journey.
 
 The three ways to see what a running system is doing, and the question each answers:
 
@@ -701,6 +840,8 @@ and come with unit tests.
 
 ## 12. HTTPS (TLS)
 
+> **In plain words:** How edgeproxy keeps users' data private on its way to and from the app.
+
 Set `tls.cert_file` and `tls.key_file` and the public listener speaks HTTPS,
 with HTTP/2 negotiated automatically and TLS 1.2 as the minimum (or 1.3 only).
 
@@ -719,6 +860,8 @@ flowchart LR
 ---
 
 ## 13. Shutting down without dropping requests
+
+> **In plain words:** How edgeproxy switches off politely, finishing the work in progress first.
 
 ```mermaid
 sequenceDiagram
@@ -745,6 +888,8 @@ sequenceDiagram
 ---
 
 ## 14. Where each piece lives in the code
+
+> **In plain words:** Which folder holds which part of the program.
 
 ```mermaid
 flowchart LR
@@ -803,6 +948,8 @@ An arrow means "uses". Everything funnels down to `backend`, the shared state.
 ---
 
 ## 15. Run it
+
+> **In plain words:** How to start edgeproxy on your own computer and try it out.
 
 ### Option A: the whole system with Docker (recommended)
 
@@ -944,6 +1091,8 @@ kubectl apply -k deploy/k8s
 
 ## 16. Config file, every field explained
 
+> **In plain words:** Every setting in the settings file, and what it changes.
+
 JSON; any field you leave out uses its default. Misspelled field names are rejected at startup.
 Durations are strings: `"250ms"`, `"5s"`, `"1m"`. Validate a file with `edgeproxy -check -config FILE`.
 
@@ -1025,6 +1174,8 @@ See [configs/local.json](configs/local.json), [deploy/compose/edgeproxy.json](de
 
 ## 17. Admin endpoints and metrics
 
+> **In plain words:** The control-room pages and live numbers you can watch.
+
 On the admin port (9090), never the public one:
 
 | Endpoint | Answers | Used by |
@@ -1056,6 +1207,8 @@ runtime metrics (`go_*`, `process_*`) are included too.
 ---
 
 ## 18. Testing and CI
+
+> **In plain words:** How the project checks itself automatically every time the code changes.
 
 Five kinds of tests, from smallest to biggest:
 

@@ -79,25 +79,31 @@ conditions without Lua/`MULTI`, fail-open vs fail-closed, hot keys.
 
 ## Phase 5 (week 5): deploy, load test, break it
 
-- [ ] Multi-stage `Dockerfile` → distroless image, runs as non-root
-- [ ] `docker-compose.yml`: 2× edgeproxy, Redis, 3× demo backends, Prometheus, Grafana
-- [ ] **k6** load tests; record req/s and p50/p99 for each strategy
-- [ ] **Chaos tests:** kill a backend mid-test, stop Redis, inject latency with Toxiproxy or `tc netem`
-- [ ] Extend CI: `staticcheck`, `govulncheck`, Docker image build
-- [ ] (Stretch) Kubernetes manifests with readiness probe + `preStop` drain
+- [x] Multi-stage `Dockerfile` → static, distroless image, runs as non-root
+- [x] `docker-compose.yml`: 2× edgeproxy, Redis, 3× demo backends (one behind Toxiproxy), Prometheus, Grafana, Jaeger
+- [x] **k6** load tests; req/s and p50/p99 recorded for each strategy ([BENCHMARKS.md](BENCHMARKS.md))
+- [x] Redis round-trip cost measured: +0.45 ms p50, +2.5 ms p99
+- [x] **Chaos tests:** kill a backend, inject 500 ms latency with Toxiproxy, stop Redis, all under load: 0 failures in 30,001 requests
+- [x] Extend CI: `staticcheck`, `govulncheck` (caught and fixed an x/net vulnerability), Docker image build, `promtool` rule tests, `kubeconform`, load and chaos tests
+- [x] Kubernetes manifests: readiness-gated draining, zero-downtime rolling updates, PDB, HPA, hardened security context
+- [x] **DNS service discovery** so Kubernetes pods behind a headless Service are found automatically
+
+**Done when:** killing a backend mid-load causes < 0.1% failed requests. ✅ Measured 0%.
 
 ## Phase 6 (week 6): polish and tell the story
 
-- [ ] TLS termination (stretch: HTTP/2 to clients, automatic certs)
-- [ ] `DESIGN.md`: architecture, trade-offs, what you'd do at 100× scale
-- [ ] README benchmark table + Grafana screenshot + chaos-test results
-- [ ] Resume bullets with **your real numbers** (template below)
+- [x] TLS termination with HTTP/2, TLS 1.2+ minimum, HTTP→HTTPS redirect, and certificate rotation without a restart
+- [x] `DESIGN.md`: architecture, trade-offs, known gaps, what I'd do at 100× scale
+- [x] README rewritten for complete beginners, with 21 diagrams; benchmark and chaos results in [BENCHMARKS.md](BENCHMARKS.md)
+- [x] Resume bullets with real numbers (below)
+- [ ] Grafana screenshot in the README (take one from http://localhost:3000 while `docker compose run --rm k6 run /scripts/load.js` runs)
 
 ---
 
-## Resume bullet template (fill in the measured numbers)
+## Resume bullets (real, measured numbers)
 
-- Built a Layer-7 load balancer in Go supporting round-robin, least-connections and consistent hashing, sustaining **__K req/s at __ ms p99** on 4 cores
-- Designed active + passive health checking and budgeted retries, keeping error rate under **__%** while backends were killed mid-load
-- Implemented a distributed sliding-window rate limiter with Redis + Lua shared across proxy replicas, with automatic fail-open to local token buckets during Redis outages
-- Instrumented RED metrics, OpenTelemetry tracing and SLO alerts; validated with k6 load tests and Toxiproxy chaos tests in CI
+- Built a production-style Layer-7 load balancer in Go with 5 balancing strategies (incl. power-of-two-choices and consistent hashing), sustaining **3,000 req/s at 1.4 ms p50 / ~6 ms p99** with 0 errors in a containerised benchmark
+- Designed active health checks, per-backend circuit breakers and budgeted retries; chaos tests that killed a backend, injected 500 ms latency and stopped Redis under load produced **0 failed requests out of 30,001**
+- Implemented a distributed sliding-window rate limiter with an atomic Redis Lua script shared across proxy replicas, adding only **0.45 ms p50**, with automatic fallback to sharded, memory-bounded local token buckets during Redis outages
+- Added hot config reload, DNS service discovery, TLS with certificate rotation, and graceful draining for zero-downtime Kubernetes rollouts
+- Instrumented RED metrics, OpenTelemetry tracing and SLO burn-rate alerts (unit-tested with promtool); gated every commit on 91 tests, fuzzing, the race detector, govulncheck and k6 load/chaos tests in GitHub Actions
