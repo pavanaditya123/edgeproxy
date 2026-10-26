@@ -166,5 +166,7 @@ func restartOnlyChanges(boot, next *config.Config) []string {
 	check("rate_limit.redis", boot.RateLimit.Redis, next.RateLimit.Redis)
 	check("rate_limit.on_redis_error", boot.RateLimit.OnRedisError, next.RateLimit.OnRedisError)
 	check("rate_limit.max_keys", boot.RateLimit.MaxKeys, next.RateLimit.MaxKeys)
+	check("access_log", boot.AccessLog, next.AccessLog)
+	check("tracing", boot.Tracing, next.Tracing)
 	return fields
 }

@@ -205,6 +205,8 @@ type echo struct {
 	Method        string `json:"method"`
 	Path          string `json:"path"`
 	XForwardedFor string `json:"x_forwarded_for"`
+	RequestID     string `json:"request_id"`
+	Traceparent   string `json:"traceparent"`
 }
 
 // fetch sends a request through the proxy. The echo is only decoded for a 200.

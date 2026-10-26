@@ -13,9 +13,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"edgeproxy/internal/backend"
 	"edgeproxy/internal/balancer"
 	"edgeproxy/internal/metrics"
+	"edgeproxy/internal/observe"
 	"edgeproxy/internal/outlier"
 )
 
@@ -117,6 +124,9 @@ func newForwarder(b *backend.Backend, transport http.RoundTripper, errorLog *log
 			// Rewrite strips any client-sent X-Forwarded-* headers before this
 			// runs, so backends only ever see the real client IP.
 			pr.SetXForwarded()
+			// Hand the trace to the backend (traceparent header), with this
+			// attempt's span as the parent. A no-op when tracing is off.
+			otel.GetTextMapPropagator().Inject(pr.In.Context(), propagation.HeaderCarrier(pr.Out.Header))
 		},
 		Transport: transport,
 		ErrorLog:  errorLog,
@@ -134,6 +144,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	pl := p.pool.Load()
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	info := observe.InfoFrom(r.Context())
 	p.budget.RecordRequest()
 
 	attempts := 1
@@ -158,8 +169,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.metrics.Retries.Inc()
 		}
 		tried = append(tried, b)
+		info.Backend, info.Attempts = b.Name(), len(tried)
 
-		err := p.forward(rec, r, pl, b)
+		err := p.forward(rec, r, pl, b, len(tried))
 		if err != nil && r.Context().Err() != nil {
 			// The client went away; there is nobody left to answer, and it's
 			// not the backend's fault. 499 is nginx's "client closed request".
@@ -186,14 +198,31 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // forward proxies r to b and returns the transport error, if any. A nil error
-// means a response (of any status) was written to w.
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, pl *pool, b *backend.Backend) error {
+// means a response (of any status) was written to w. Each attempt gets its own
+// client span, so a trace shows retries as separate tries.
+func (p *Proxy) forward(w *statusRecorder, r *http.Request, pl *pool, b *backend.Backend, attempt int) error {
 	b.Acquire()
 	defer b.Release()
 
+	ctx, span := observe.Tracer().Start(r.Context(), "proxy to backend",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("server.address", b.Name()), attribute.Int("edgeproxy.attempt", attempt)))
+	defer span.End()
+
 	var err error
-	ctx := context.WithValue(r.Context(), attemptErrKey{}, &err)
+	ctx = context.WithValue(ctx, attemptErrKey{}, &err)
 	pl.forwarders[b].ServeHTTP(w, r.WithContext(ctx))
+
+	switch {
+	case err != nil:
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "backend unreachable")
+	case w.status >= 500:
+		span.SetAttributes(attribute.Int("http.response.status_code", w.status))
+		span.SetStatus(codes.Error, http.StatusText(w.status))
+	default:
+		span.SetAttributes(attribute.Int("http.response.status_code", w.status))
+	}
 	return err
 }
 

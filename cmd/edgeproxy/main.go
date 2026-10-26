@@ -17,6 +17,7 @@ import (
 
 	"edgeproxy/internal/config"
 	"edgeproxy/internal/metrics"
+	"edgeproxy/internal/observe"
 	"edgeproxy/internal/proxy"
 )
 
@@ -59,6 +60,22 @@ func run(configPath string, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if tr := cfg.Tracing; tr.Enabled {
+		shutdownTracing, err := observe.SetupTracing(ctx, observe.TracingConfig{
+			Endpoint: tr.Endpoint, Insecure: tr.Insecure, SampleRatio: tr.SampleRatio, ServiceName: tr.ServiceName,
+		})
+		if err != nil {
+			return fmt.Errorf("tracing: %w", err)
+		}
+		defer func() {
+			// Flush spans still buffered, but don't hang shutdown on a dead collector.
+			flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = shutdownTracing(flushCtx)
+		}()
+		logger.Info("tracing enabled", "endpoint", tr.Endpoint, "sample_ratio", tr.SampleRatio)
+	}
+
 	srv := &server{configPath: configPath, boot: cfg, px: px, limiter: limiter, metrics: m, logger: logger, lastConfigSum: sha256.Sum256(data)}
 	// The first apply probes every backend before the listener opens, so the
 	// first requests don't hit dead backends.
@@ -71,9 +88,20 @@ func run(configPath string, logger *slog.Logger) error {
 	admin := newAdminServer(cfg.AdminListen, m, px.Backends, &draining, func() error {
 		return srv.reload(ctx, "admin API")
 	})
+	// Outermost first: every request gets an ID, then a trace span, then an
+	// access-log line, so even rate-limited (429) requests are logged and traced.
+	var handler http.Handler = limiter.Middleware(px)
+	if cfg.AccessLog {
+		handler = observe.AccessLog(logger)(handler)
+	}
+	if cfg.Tracing.Enabled {
+		handler = observe.Tracing(handler)
+	}
+	handler = observe.RequestID(handler)
+
 	public := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           limiter.Middleware(px),
+		Handler:           handler,
 		ReadHeaderTimeout: cfg.Timeouts.ReadHeader.Std(),
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),

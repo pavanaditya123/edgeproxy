@@ -53,6 +53,8 @@ func main() {
 			"method":          r.Method,
 			"path":            r.URL.Path,
 			"x_forwarded_for": r.Header.Get("X-Forwarded-For"),
+			"request_id":      r.Header.Get("X-Request-ID"),
+			"traceparent":     r.Header.Get("traceparent"),
 		})
 	})
 

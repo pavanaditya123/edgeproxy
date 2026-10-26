@@ -33,6 +33,20 @@ type Config struct {
 	ReloadInterval Duration `json:"reload_interval"`
 
 	RateLimit RateLimit `json:"rate_limit"`
+
+	// AccessLog writes one JSON log line per request.
+	AccessLog bool    `json:"access_log"`
+	Tracing   Tracing `json:"tracing"`
+}
+
+// Tracing exports OpenTelemetry traces over OTLP/HTTP.
+type Tracing struct {
+	Enabled bool `json:"enabled"`
+	// Endpoint is the collector's host:port, e.g. "localhost:4318".
+	Endpoint    string  `json:"endpoint"`
+	Insecure    bool    `json:"insecure"`
+	SampleRatio float64 `json:"sample_ratio"`
+	ServiceName string  `json:"service_name"`
 }
 
 // RateLimit configures request rate limiting. With no rules nothing is limited.
@@ -191,6 +205,13 @@ func Default() *Config {
 			OnRedisError: "local",
 			MaxKeys:      100_000,
 		},
+		AccessLog: true,
+		Tracing: Tracing{
+			Endpoint:    "localhost:4318",
+			Insecure:    true,
+			SampleRatio: 1,
+			ServiceName: "edgeproxy",
+		},
 	}
 }
 
@@ -303,6 +324,14 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("reload_interval must not be negative"))
 	}
 	errs = append(errs, c.RateLimit.validate()...)
+	if tr := c.Tracing; tr.Enabled {
+		if tr.Endpoint == "" || tr.ServiceName == "" {
+			errs = append(errs, errors.New("tracing needs an endpoint and a service_name"))
+		}
+		if tr.SampleRatio < 0 || tr.SampleRatio > 1 {
+			errs = append(errs, errors.New("tracing.sample_ratio must be between 0 and 1"))
+		}
+	}
 	return errors.Join(errs...)
 }
 

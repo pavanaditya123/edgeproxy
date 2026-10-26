@@ -10,10 +10,15 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"edgeproxy/internal/backend"
 	"edgeproxy/internal/balancer"
 	"edgeproxy/internal/metrics"
+	"edgeproxy/internal/observe"
 	"edgeproxy/internal/outlier"
 )
 
@@ -250,6 +255,54 @@ func TestSetPoolSwapsBackendsForNewRequests(t *testing.T) {
 		if _, body := get(t, srv.URL); body != "new" {
 			t.Fatalf("got %q after the swap, want new", body)
 		}
+	}
+}
+
+func TestProxyTracesEachAttemptAndPropagatesTheTrace(t *testing.T) {
+	spans := tracetest.NewSpanRecorder()
+	prevTP, prevProp := otel.GetTracerProvider(), otel.GetTextMapPropagator()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans)))
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTracerProvider(prevTP); otel.SetTextMapPropagator(prevProp) })
+
+	var backendSaw string
+	live := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		backendSaw = r.Header.Get("traceparent")
+	}))
+	t.Cleanup(live.Close)
+	_, _, _, p := newTestProxyWith(t, nil, deadServer(), live.URL)
+	// Wrapped in the Tracing middleware, as main does.
+	srv := httptest.NewServer(observe.Tracing(p))
+	t.Cleanup(srv.Close)
+
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	req.Header.Set("traceparent", "00-"+traceID+"-00f067aa0ba902b7-01")
+	if code, _ := do(t, req); code != http.StatusOK {
+		t.Fatalf("status %d", code)
+	}
+
+	ended := spans.Ended() // in end order: attempt 1, attempt 2, server span
+	if len(ended) != 3 {
+		t.Fatalf("%d spans, want a server span plus one per attempt", len(ended))
+	}
+	first, second, server := ended[0], ended[1], ended[2]
+	for _, s := range ended {
+		if s.SpanContext().TraceID().String() != traceID {
+			t.Errorf("span %q is in trace %s, want the client's trace", s.Name(), s.SpanContext().TraceID())
+		}
+	}
+	for _, attempt := range []sdktrace.ReadOnlySpan{first, second} {
+		if attempt.Parent().SpanID() != server.SpanContext().SpanID() {
+			t.Errorf("attempt span %q should be a child of the server span", attempt.Name())
+		}
+	}
+	if first.Status().Code.String() != "Error" || second.Status().Code.String() == "Error" {
+		t.Errorf("attempt statuses %v, %v; want the first failed and the second ok", first.Status(), second.Status())
+	}
+	wantPrefix := "00-" + traceID + "-" + second.SpanContext().SpanID().String()
+	if !strings.HasPrefix(backendSaw, wantPrefix) {
+		t.Errorf("backend got traceparent %q, want the successful attempt as its parent (%s-..)", backendSaw, wantPrefix)
 	}
 }
 
