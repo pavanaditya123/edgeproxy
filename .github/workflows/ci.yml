@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,13 +14,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -37,11 +39,56 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
 
-      - name: Vet
-        run: go vet ./...
+      - name: Vet (including end-to-end tests)
+        run: go vet -tags e2e ./...
 
       - name: Build
         run: go build ./...
 
-      - name: Test with race detector
-        run: go test -race -count=1 ./...
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Test with race detector and coverage
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: |
+          {
+            echo "### Unit test coverage"
+            echo '```'
+            go tool cover -func=coverage.out
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+
+  e2e:
+    name: End-to-end tests
+    needs: [lint, unit]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # Builds edgeproxy and demobackend (with the race detector), runs them as
+      # real processes and checks load balancing, health checks, retries and
+      # graceful shutdown over real HTTP. See e2e/e2e_test.go.
+      - name: Run end-to-end tests
+        env:
+          E2E_RACE: "1"
+        run: go test -tags e2e -count=1 -v ./e2e/
