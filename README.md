@@ -1,13 +1,27 @@
 # edgeproxy
 
 **edgeproxy is a load balancer.** It sits in front of several copies of a web
-server and decides which copy handles each incoming request. If one copy
-crashes, users don't notice, because edgeproxy stops sending traffic to it and
-retries on a healthy one.
+server and decides which copy handles each incoming request. If a copy
+crashes, slows down or starts returning errors, users don't notice: edgeproxy
+steers around it, retries safely, and keeps abusive clients in check with
+rate limits.
 
 It's written in Go and built the way real production load balancers (Nginx,
-Envoy, AWS ALB) work, at a size you can read in an afternoon.
-See [PLAN.md](PLAN.md) for the roadmap: rate limiting, tracing, load tests and chaos tests.
+Envoy, AWS ALB) work, at a size you can read in a weekend:
+
+- **5 balancing strategies:** round robin, weighted round robin, least connections, power of two choices, consistent hashing
+- **Two kinds of health checking:** active probes plus passive "circuit breakers"
+- **Safe retries** with a retry budget, so a failure can't snowball
+- **Rate limiting** shared across every proxy through Redis, with a fallback when Redis is down
+- **Observability:** Prometheus metrics, JSON access logs, OpenTelemetry tracing, a Grafana dashboard and SLO alerts
+- **Operations:** hot config reload, DNS service discovery, TLS with HTTP/2 and certificate rotation, graceful shutdown
+- **Proof:** unit, fuzz, end-to-end, load and chaos tests, all in CI
+
+Measured on a laptop: **3,000 req/s at 1.4 ms p50 / ~6 ms p99**, and **zero
+failed requests out of 30,001** while a backend was killed, another was slowed
+by 500 ms and Redis was stopped, all mid-load. See [BENCHMARKS.md](BENCHMARKS.md).
+For the design trade-offs, see [DESIGN.md](DESIGN.md); for how it was built
+step by step, [PLAN.md](PLAN.md).
 
 ---
 
@@ -16,16 +30,21 @@ See [PLAN.md](PLAN.md) for the roadmap: rate limiting, tracing, load tests and c
 1. [The 30-second version (a bank analogy)](#1-the-30-second-version-a-bank-analogy)
 2. [Words you need first](#2-words-you-need-first)
 3. [The whole system in one picture](#3-the-whole-system-in-one-picture)
-4. [Life of a request, step by step](#4-life-of-a-request-step-by-step)
-5. [When does it retry?](#5-when-does-it-retry)
-6. [How a backend is chosen (the 3 strategies)](#6-how-a-backend-is-chosen-the-3-strategies)
-7. [Health checking: how a dead server is detected](#7-health-checking-how-a-dead-server-is-detected)
-8. [Shutting down without dropping requests](#8-shutting-down-without-dropping-requests)
-9. [Where each piece lives in the code](#9-where-each-piece-lives-in-the-code)
-10. [Run it locally](#10-run-it-locally)
-11. [Config file, every field explained](#11-config-file-every-field-explained)
-12. [Admin endpoints and metrics](#12-admin-endpoints-and-metrics)
-13. [Continuous integration](#13-continuous-integration)
+4. [What happens to every request, layer by layer](#4-what-happens-to-every-request-layer-by-layer)
+5. [Life of a request when a backend has just crashed](#5-life-of-a-request-when-a-backend-has-just-crashed)
+6. [When does it retry? (and the retry budget)](#6-when-does-it-retry-and-the-retry-budget)
+7. [How a backend is chosen (5 strategies)](#7-how-a-backend-is-chosen-5-strategies)
+8. [Health checking: active probes and circuit breakers](#8-health-checking-active-probes-and-circuit-breakers)
+9. [Rate limiting](#9-rate-limiting)
+10. [Changing config without a restart](#10-changing-config-without-a-restart)
+11. [Seeing inside: metrics, logs and traces](#11-seeing-inside-metrics-logs-and-traces)
+12. [HTTPS (TLS)](#12-https-tls)
+13. [Shutting down without dropping requests](#13-shutting-down-without-dropping-requests)
+14. [Where each piece lives in the code](#14-where-each-piece-lives-in-the-code)
+15. [Run it](#15-run-it)
+16. [Config file, every field explained](#16-config-file-every-field-explained)
+17. [Admin endpoints and metrics](#17-admin-endpoints-and-metrics)
+18. [Testing and CI](#18-testing-and-ci)
 
 ---
 
@@ -74,13 +93,18 @@ Picture a bank branch with one **front desk** and several **tellers**.
 | A customer walks in | A **request** arrives (someone opens a web page or calls an API) |
 | The front desk sends each customer to a teller | **edgeproxy** forwards each request to a **backend** server |
 | Tellers | **Backends**: identical copies of your web server |
-| A supervisor walks round every few seconds checking each teller is awake | The **health checker** asks every backend "are you OK?" every 2 seconds |
+| A supervisor walks round every few seconds checking each teller is awake | The **health checker** asks every backend "are you OK?" every few seconds |
+| A teller who is awake but keeps getting things wrong is sent on a break, then given one customer on trial | **Outlier detection** (a *circuit breaker*) ejects a backend that keeps failing real requests, then lets it back in on trial |
 | A teller faints mid-conversation, so the desk sends the customer to another teller | A backend crashes, so edgeproxy **retries** the request on another backend |
 | ...but only if the request is safe to repeat. "What's my balance?" is safe to ask twice; "deposit ₹5,000" is not | Only **idempotent** requests (`GET`) are retried; `POST` is not, because it might run twice |
-| "Send each customer to whoever has the shortest queue" | The **least connections** strategy |
+| If half the tellers faint, the desk doesn't make every customer queue three times | The **retry budget** caps retries so a failure can't snowball |
+| "Each customer may visit at most 5 times a minute", enforced at every branch | **Rate limiting**, shared across every edgeproxy through **Redis** |
+| "Send each customer to whoever has the shortest queue" | The **least connections** and **power of two choices** strategies |
 | "Customer #42 always goes to the teller who has their file" | The **consistent hashing** strategy |
+| Every customer gets a ticket number that's written on every form they touch | Every request gets a **request ID** that appears in logs, traces and the backend |
+| Opening a new teller window without closing the branch | **Hot reload**: change the backend list without a restart |
 | At closing time, put up a "closed" sign but finish serving the people already inside | **Graceful shutdown** with a **drain** period |
-| A board on the wall counting customers served and wait times | **Metrics**, read by **Prometheus** |
+| A board on the wall counting customers served and wait times | **Metrics**, read by **Prometheus** and drawn by **Grafana** |
 
 Keep this picture in mind; every section below is one row of this table in more detail.
 
@@ -101,9 +125,10 @@ Each term is used later in this README and in the code.
 | **Method: `GET`** | "Give me something." Reading only; it changes nothing on the server. |
 | **Method: `POST`** | "Here is some data, do something with it" (place an order, send a message). It changes things on the server. |
 | **Header** | A line of metadata on a request or response, such as `Content-Type: application/json`. |
-| **Status code** | A 3-digit number in the response saying how it went. `200` = OK, `404` = not found, `500` = the server crashed while handling it. Codes this project uses are explained in the [table below](#status-codes-edgeproxy-can-return). |
+| **Status code** | A 3-digit number in the response saying how it went. `200` = OK, `404` = not found, `500` = the server crashed while handling it. The ones edgeproxy itself sends are in the [table below](#status-codes-edgeproxy-can-return). |
 | **Port** | A number that picks which program on a machine gets the traffic. `localhost:8080` means "this machine, port 8080". |
 | **TCP connection** | The underlying "phone line" between two machines that HTTP travels over. Opening one takes a round-trip handshake, so it's slow to create and worth reusing. |
+| **DNS** | The internet's phone book: it turns a name like `api.example.com` into IP addresses. |
 | **Latency** | How long something takes, e.g. "50 ms latency". |
 
 Here's what a request and its response actually look like, with each part labelled:
@@ -125,13 +150,14 @@ A `POST` looks the same, except the request also carries a **body**, e.g. `{"ite
 | Term | Plain meaning |
 |---|---|
 | **Proxy** | A middleman program. The client talks to the proxy, and the proxy talks to the real server on the client's behalf. |
-| **Reverse proxy** | A proxy that sits in front of *servers* (as opposed to a proxy that sits in front of *clients*, like a corporate web filter). Clients think they're talking to one server; really the reverse proxy is passing requests along. |
+| **Reverse proxy** | A proxy that sits in front of *servers* (as opposed to one in front of *clients*, like a corporate web filter). Clients think they're talking to one server. |
 | **Load balancer** | A reverse proxy that spreads requests across several servers so no single one is overloaded and any one can fail safely. edgeproxy is one. |
-| **Layer 7 (L7)** | "Understands HTTP." An L7 load balancer can read the method, path and headers and make decisions with them. A **Layer 4 (L4)** balancer only sees raw TCP connections and bytes. Names come from the 7-layer OSI networking model. |
-| **Backend** (also called **upstream**) | One of the real servers behind the load balancer. Here: the 3 `demobackend` processes on ports 9001–9003. |
-| **Balancing strategy** | The rule used to pick a backend for each request (see [section 6](#6-how-a-backend-is-chosen-the-3-strategies)). |
-| **In-flight requests** | Requests a backend is working on right now. edgeproxy keeps a live count for each backend. |
-| **Connection pool / keep-alive** | Instead of opening a new TCP connection for every request (slow), edgeproxy keeps finished connections open and reuses them. This is the single biggest performance win in a proxy. |
+| **Layer 7 (L7)** | "Understands HTTP." An L7 load balancer can read the method, path and headers and decide with them. A **Layer 4 (L4)** balancer only sees raw TCP connections. The names come from the 7-layer OSI networking model. |
+| **Backend** (also **upstream**) | One of the real servers behind the load balancer. |
+| **Balancing strategy** | The rule used to pick a backend for each request ([section 7](#7-how-a-backend-is-chosen-5-strategies)). |
+| **In-flight requests** | Requests a backend is working on right now. edgeproxy keeps a live count per backend. |
+| **Connection pool / keep-alive** | Instead of opening a new TCP connection for every request (slow), edgeproxy keeps finished connections open and reuses them. The single biggest performance win in a proxy. |
+| **Middleware** | A layer that wraps the request handler, doing one job (give it an ID, check its rate limit, log it) before passing the request on. Layers stack like an onion. |
 
 Why the connection pool matters, side by side:
 
@@ -164,50 +190,85 @@ Go's default pool keeps only **2** idle connections per backend, so under load m
 
 | Term | Plain meaning |
 |---|---|
-| **Health check (probe)** | edgeproxy regularly sends `GET /healthz` to each backend. A `2xx` answer within the timeout = pass; anything else = fail. |
-| **Healthy / alive / up** | A backend that's passing health checks and allowed to receive traffic. Opposite: **unhealthy / dead / down**. |
+| **Health check (probe)** | edgeproxy regularly sends `GET /healthz` to each backend. A `2xx` answer within the timeout = pass; anything else = fail. This is **active** health checking. |
+| **Healthy / up** | A backend that's allowed to receive traffic. Opposite: **unhealthy / down**. |
 | **Threshold** | How many passes or failures *in a row* are needed before edgeproxy changes its mind about a backend. |
 | **Flapping** | A backend bouncing rapidly between up and down because of one-off glitches. Thresholds prevent it. |
+| **Outlier detection** | **Passive** health checking: watching real responses and ejecting a backend that keeps failing them, without waiting for the next probe. |
+| **Circuit breaker** | The pattern outlier detection uses. *Closed* = normal, *open* = ejected (no traffic), *half-open* = let back in on trial. Named after the electrical switch that cuts power when something's wrong. |
 | **Retry** | Trying a failed request again, on a *different* backend. |
 | **Idempotent** | Safe to do more than once with the same result. Reading your balance is idempotent; transferring money is not. Only idempotent requests are safe to retry. |
+| **Retry storm** | When every failed request is retried several times, a struggling system suddenly gets 2–3× its normal traffic, and falls over completely. |
+| **Retry budget** | A cap on retries (here 20% of recent traffic) that prevents retry storms. |
+| **Load shedding** | Deliberately refusing some work when overloaded, so the rest still succeeds. `max_inflight_per_backend` does this. |
 | **Timeout** | The maximum time to wait for something before giving up. |
 | **Graceful shutdown** | Stopping the program *without* cutting off requests that are halfway through. |
-| **Drain** | The period during shutdown when the proxy tells the outside world "don't send me new work" but keeps finishing the current work. |
-| **Signal / SIGTERM** | The operating system's way of telling a program to stop. `SIGTERM` = "please stop" (what Kubernetes and Docker send). Pressing Ctrl+C sends a similar signal called `SIGINT`. |
+| **Drain** | The period during shutdown when the proxy tells the outside world "don't send me new work" but keeps finishing current work. |
+| **Signal / SIGTERM / SIGHUP** | The operating system's way of poking a program. `SIGTERM` = "please stop" (what Kubernetes and Docker send); Ctrl+C sends the similar `SIGINT`; `SIGHUP` traditionally means "reload your config". |
 | **Liveness** | "Is the process running at all?" If not, restart it. (`/healthz`) |
 | **Readiness** | "Should this instance get traffic *right now*?" It can be alive but not ready, e.g. while draining. (`/readyz`) |
+| **Hot reload** | Applying a new config to a running process, without restarting it or dropping a connection. |
+| **Service discovery** | Finding backends automatically instead of listing them by hand. edgeproxy does it through DNS. |
 
-### Hashing
-
-| Term | Plain meaning |
-|---|---|
-| **Hash function** | Turns any text into a big number, always the same number for the same text. `hash("user-42")` is always the same value. |
-| **Consistent hashing** | A way of mapping keys (like a user ID) to backends so that when a backend is removed, *only that backend's* keys move. A naive `hash % 3` would reshuffle almost everyone. |
-| **Hash ring** | Picture all possible hash values laid out round a clock face. Backends and keys are placed on that clock by their hash. |
-| **Virtual node** | Each backend is placed on the ring many times (128 here), not once, so the ring is evenly covered and each backend gets a fair share. |
-| **Sticky routing** | The same user always reaching the same backend. Useful when a backend keeps a cache or a session for that user. |
-
-### Observability
+### Hashing and rate limiting
 
 | Term | Plain meaning |
 |---|---|
+| **Hash function** | Turns any text into a big number, always the same number for the same text. |
+| **Consistent hashing** | Mapping keys (like a user ID) to backends so that when a backend is removed, *only that backend's* keys move. |
+| **Hash ring / virtual node** | All hash values laid out round a clock face; each backend placed on it many times (128 here) so the clock is evenly covered. |
+| **Sticky routing** | The same user always reaching the same backend. |
+| **Rate limit** | A cap on how many requests one client may send in a time window, e.g. 100 per second. Over the limit, the client gets `429 Too Many Requests`. |
+| **Token bucket** | A rate-limit algorithm: a bucket holds up to N tokens, refills steadily, and each request spends one. Allows short bursts but caps the average. |
+| **Sliding window** | A rate-limit algorithm counting requests in "the last 60 seconds" as a moving window, so there's no burst at the boundary between minutes. |
+| **Redis** | A very fast in-memory database. Here it holds the rate-limit counters that every edgeproxy instance shares. |
+| **Lua script** | A small program Redis runs *atomically* (nothing else happens in between), so two proxies can't both take the last allowed request. |
+| **Fail open / fail closed** | What to do when a safety system (here, Redis) breaks: *fail open* lets traffic through, *fail closed* blocks it. edgeproxy defaults to a middle ground: limit locally. |
+| **LRU (least recently used)** | When memory is full, throw away whatever was used longest ago. Bounds the local rate limiter's memory. |
+
+### Observability and security
+
+| Term | Plain meaning |
+|---|---|
+| **Observability** | Being able to tell what a running system is doing from the outside: metrics, logs and traces. |
 | **Metrics** | Numbers about the system over time: requests per second, error count, latency. |
-| **Prometheus** | A widely used open-source tool that **scrapes** (fetches) metrics from `/metrics` every few seconds and stores them. Grafana then draws graphs from it. |
-| **Counter** | A metric that only goes up (total requests served). |
-| **Gauge** | A metric that goes up and down (requests in flight right now). |
-| **Histogram** | A metric that sorts measurements into buckets ("how many requests took under 10 ms, under 50 ms, ...") so you can compute percentiles. |
-| **p99 (99th percentile)** | 99% of requests were faster than this. If p99 = 200 ms, 1 in 100 users waited longer than 200 ms. Big companies care more about p99 than averages, because averages hide the slow, unhappy users. |
-| **Structured logs** | Log lines written as JSON (`{"level":"WARN","msg":"backend is down",...}`) so machines can search and filter them. |
-| **`X-Forwarded-For`** | A header saying which client IP the request originally came from, since backends only see the proxy's IP. edgeproxy **overwrites** any value the client sends, because a client could fake it. |
+| **Prometheus** | An open-source tool that **scrapes** (fetches) metrics from `/metrics` every few seconds and stores them. |
+| **Grafana** | Draws graphs and dashboards from Prometheus data. |
+| **Counter / gauge / histogram** | A metric that only goes up / one that goes up and down / one that sorts measurements into buckets so you can compute percentiles. |
+| **p99 (99th percentile)** | 99% of requests were faster than this. Big companies watch p99 more than averages, because averages hide the slow, unhappy users. |
+| **SLO (service level objective)** | A reliability target, e.g. "99.9% of requests succeed". The allowed 0.1% of failures is the **error budget**; alerts fire when it's being used up too fast (**burn rate**). |
+| **Structured logs** | Log lines written as JSON so machines can search and filter them. |
+| **Request ID** | A unique ID (`X-Request-ID`) given to each request and recorded everywhere it goes, so one ID finds everything about it. |
+| **Trace / span** | A *trace* is the full journey of one request across services; each step in it (the proxy, each backend attempt) is a *span*, with a start time, a duration and a parent. |
+| **OpenTelemetry (OTel)** | The industry-standard library and protocol (**OTLP**) for traces. **Jaeger** is one tool that stores and displays them. |
+| **`traceparent`** | The W3C-standard header that carries a trace ID from service to service, so their spans join up into one trace. |
+| **`X-Forwarded-For`** | A header saying which client IP a request came from. edgeproxy **overwrites** any value the client sends, because a client could fake it. |
+| **TLS / HTTPS** | Encryption for HTTP. The server proves who it is with a **certificate**; **TLS termination** means edgeproxy decrypts here and talks plain HTTP to the backends on the private network. |
+| **HTTP/2** | A newer version of HTTP that sends many requests over one connection at once. Browsers use it automatically over HTTPS. |
+
+### Containers and deployment
+
+| Term | Plain meaning |
+|---|---|
+| **Container / Docker** | A program packaged with everything it needs to run, so it runs the same on any machine. |
+| **Image / distroless** | The packaged, read-only template a container starts from. *Distroless* images contain only the program: no shell, no package manager, so almost nothing for an attacker to use. |
+| **Docker Compose** | Starts several containers together from one file (`docker-compose.yml`): here, the whole system. |
+| **Kubernetes (K8s)** | A system that runs containers across many machines, restarts them when they die and scales them up and down. |
+| **Pod / Deployment / Service** | A *pod* is one running copy of a container; a *Deployment* keeps N pods running and rolls out new versions; a *Service* gives pods one stable name. A **headless** Service's name resolves to every pod's own IP, which is how edgeproxy discovers them. |
+| **Load test / k6** | Sending lots of realistic traffic to measure speed and find limits. *k6* is the load-testing tool used here. |
+| **Chaos test** | Deliberately breaking things (killing servers, adding delays) under load to prove the system copes. |
+| **CI (continuous integration)** | Every change is automatically built and tested by a server before anyone relies on it. |
 
 ### Status codes edgeproxy can return
 
 | Code | Name | When edgeproxy sends it |
 |---|---|---|
 | **2xx–5xx from the backend** | (passed through) | The backend answered; edgeproxy forwards its answer unchanged, even if it's a `500`. |
-| **502** | Bad Gateway | edgeproxy reached for a backend but couldn't get *any* response (connection refused, reset, or timed out) on every allowed attempt. |
-| **503** | Service Unavailable | Every backend is currently marked unhealthy, so there was nobody to send the request to. |
-| **499** | Client Closed Request | Not actually sent (the client is gone); it's recorded in metrics when the client hung up before an answer came back. The code is an Nginx convention. |
+| **308** | Permanent Redirect | On the optional plain-HTTP listener: "use the HTTPS address instead". |
+| **429** | Too Many Requests | The client went over a rate limit. Comes with `Retry-After` saying how many seconds to wait. |
+| **502** | Bad Gateway | edgeproxy couldn't get *any* response from a backend on every allowed attempt. |
+| **503** | Service Unavailable | No backend can take the request: all unhealthy, ejected or at capacity. |
+| **499** | Client Closed Request | Not actually sent (the client is gone); recorded in metrics when the client hung up first. An Nginx convention. |
 
 ---
 
@@ -215,96 +276,115 @@ Go's default pool keeps only **2** idle connections per backend, so under load m
 
 ```mermaid
 flowchart TB
-    CL["Client<br/>browser, app, curl"] -->|"1. HTTP request"| PUB
+    CL["Client<br/>browser, app, curl"] -->|"1. HTTP or HTTPS"| PUB
 
     subgraph EP["edgeproxy (one process)"]
-        PUB["Public listener<br/>port 8080"] --> PX["Proxy handler<br/>forwards, retries,<br/>records metrics"]
-        PX -->|"2. which backend?"| BAL["Balancer<br/>picks a backend"]
-        BAL -->|"reads"| TBL[("Backend table<br/>alive? in-flight?")]
-        HC["Health checker<br/>every 2s"] -->|"writes alive / dead"| TBL
-        ADM["Admin listener, port 9090<br/>/metrics /healthz<br/>/readyz /backends"]
+        PUB["Public listener :8080<br/>TLS and HTTP/2 optional"] --> MW["Middleware layers<br/>request ID, tracing,<br/>access log, rate limiter"]
+        MW --> PX["Proxy handler<br/>retries + retry budget"]
+        PX -->|"2. which backend?"| BAL["Balancer<br/>5 strategies"]
+        BAL -->|"reads"| TBL[("Backend table<br/>healthy? ejected?<br/>in-flight?")]
+        KEEP["Keep the table current:<br/>active health checks,<br/>circuit breakers,<br/>config reload, DNS discovery"] -->|"writes"| TBL
+        ADM["Admin listener :9090<br/>/metrics /readyz<br/>/backends /-/reload"]
     end
 
     subgraph BK["Backends: identical copies of your app"]
-        A["A<br/>port 9001"]
-        B["B<br/>port 9002"]
-        C["C<br/>port 9003"]
+        A["A"]
+        B["B"]
+        C["C"]
     end
 
     PX ==>|"3. forwarded request"| BK
-    HC -.->|"GET /healthz"| BK
-    ADM -.->|"scraped by"| PROM["Prometheus"]
+    KEEP -.->|"GET /healthz"| BK
 ```
 
-**How to read it:** solid arrows are real user traffic; dotted arrows are background checks.
+**How to read it:** solid arrows are real user traffic; dotted arrows are background work.
 
-- The **public listener** (port 8080) is the front door: the only address clients know about.
-- The **proxy handler** takes each request, asks the **balancer** which backend should get it, forwards it, and sends the backend's answer back to the client.
-- The **balancer** only picks backends that the **backend table** says are alive.
-- The **health checker** runs on its own in the background, probing each backend every 2 seconds and updating the table. It's the only thing that marks backends alive or dead.
-- The **admin listener** (port 9090) is a separate door for operators and monitoring tools. It's on a different port on purpose, so the public can't read your metrics or backend list.
+- The **public listener** is the front door, the only address clients know. It can speak HTTPS ([section 12](#12-https-tls)).
+- The **middleware layers** run on every request before it's forwarded ([section 4](#4-what-happens-to-every-request-layer-by-layer)).
+- The **proxy handler** asks the **balancer** for a backend, forwards the request, retries safely if needed, and reports every result to that backend's circuit breaker.
+- Four things keep the **backend table** current: **active health checks** (probes), **circuit breakers** (real results), **config reload** and **DNS discovery**.
+- Outside the process (shown in the [Docker Compose picture](#option-a-the-whole-system-with-docker-recommended)): **Redis** holds rate-limit counters shared by every edgeproxy instance, **Jaeger** receives traces, and **Prometheus** scrapes metrics from the separate **admin listener**, which is kept off the public port on purpose.
 
 ---
 
-## 4. Life of a request, step by step
+## 4. What happens to every request, layer by layer
 
-Here's the interesting case: backend A has just crashed, and the health checker hasn't noticed yet.
+Before a request is forwarded it passes through four middleware layers, like
+going through the checks at an airport. Each does one job and passes the
+request inward; the response travels back out through the same layers.
+
+```mermaid
+flowchart TB
+    IN(["Request arrives"]) --> RID["1. Request ID<br/>keep a well-formed X-Request-ID,<br/>or make a new one"]
+    RID --> TR["2. Tracing<br/>start a span, continuing the<br/>caller's trace if it sent traceparent"]
+    TR --> AL["3. Access log<br/>start a stopwatch; write one JSON<br/>line when the response is done"]
+    AL --> RL{"4. Rate limiter<br/>does a rule match,<br/>and is the client over it?"}
+    RL -->|"over the limit"| R429(["429 Too Many Requests<br/>with Retry-After"])
+    RL -->|"no rule, or under the limit"| PX["Proxy handler<br/>pick a backend, forward, retry"]
+    PX --> OUT(["Response goes back out<br/>through the same layers"])
+```
+
+The order matters: the ID comes first so *everything* after it can record it,
+and logging and tracing sit outside the rate limiter so that even rejected
+(429) requests are logged and traced. See `main.go` in
+[cmd/edgeproxy](cmd/edgeproxy/main.go).
+
+---
+
+## 5. Life of a request when a backend has just crashed
+
+Backend A has just crashed, and the health checker hasn't noticed yet.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Client
+    participant M as Middleware
     participant P as Proxy handler
-    participant L as Balancer
     participant A as Backend A
     participant B as Backend B
 
-    C->>P: GET /hello
-    P->>L: pick a healthy backend
-    L-->>P: Backend A
-    P->>A: GET /hello + X-Forwarded-For
+    C->>M: GET /hello
+    Note over M: ID 9f2c, span started, rate limit OK
+    M->>P: GET /hello
+    P->>A: GET /hello (+ ID and trace headers)
     A--xP: connection refused (A crashed)
-    Note over P: GET with no body is safe to repeat
-    P->>L: pick again, but not A
-    L-->>P: Backend B
-    P->>B: GET /hello
+    Note over P: safe to repeat,<br/>budget has room
+    P->>B: GET /hello (retry, a different backend)
     B-->>P: 200 OK and the page
-    P-->>C: 200 OK and the page
-    Note over P: update metrics
+    P-->>M: 200 OK
+    M-->>C: 200 OK + X-Request-ID 9f2c
+    Note over P: A's failure is reported to its circuit breaker
 ```
 
-What happens at each numbered step:
+1. The request gets an ID, a trace span, and passes the rate limiter.
+2. The balancer picks **A** (it hasn't been marked down yet).
+3. edgeproxy forwards to A. It reuses a pooled connection if it can, and sets `X-Forwarded-For` to the real client IP, `X-Request-ID`, and a `traceparent` header so A's own logs and traces can join up.
+4. **A refuses the connection.** No response came back, so nothing has been sent to the client yet.
+5. It's a `GET` with no body, so repeating it is safe, and the **retry budget** has room. edgeproxy asks the balancer again, excluding A.
+6. **B** answers `200 OK`, which streams back to the client with the same request ID.
+7. A's failure was reported to its **circuit breaker**; a few more and A is ejected even before the health checker notices.
 
-1. **Client sends `GET /hello`** to edgeproxy on port 8080. The client has no idea backends exist.
-2. **Proxy asks the balancer** for a backend. It passes a rule: "must be alive, and must not be one we already tried for this request".
-3. **Balancer answers "A"**, because the health checker last saw A as alive.
-4. **Proxy forwards the request to A.** It rewrites the address to A's, and sets `X-Forwarded-For` to the real client IP (throwing away any value the client tried to send). It reuses a pooled TCP connection if one is free.
-5. **A doesn't answer**: its process is gone, so the operating system refuses the connection.
-6. **Proxy checks whether a retry is safe.** It's a `GET` with no body, so repeating it can't cause harm (see [section 5](#5-when-does-it-retry)).
-7. **Proxy asks the balancer again**, now excluding A.
-8. **Balancer answers "B".**
-9. **Proxy forwards to B.**
-10. **B answers `200 OK`.**
-11. **Proxy streams B's answer back to the client.** The client got a normal response and never knew A was dead.
-12. **Metrics are updated:** one request counted against B with code 200, its total time recorded, one retry counted, one upstream error counted against A.
-
-Within about 2–6 seconds the health checker also notices A is down and marks it dead, so later requests skip A on the first try.
+The access log line and the trace both record: backend B, 2 attempts, status 200.
 
 ---
 
-## 5. When does it retry?
+## 6. When does it retry? (and the retry budget)
 
 ```mermaid
 flowchart TD
     S(["Request arrives"]) --> R{"Is it GET, HEAD or OPTIONS<br/>with no body?"}
-    R -->|"yes: safe to repeat"| T1["Allowed attempts = 1 + max_retries<br/>default 1 + 2 = 3"]
+    R -->|"yes: safe to repeat"| T1["Allowed attempts = 1 + max_retries<br/>default 3"]
     R -->|"no: e.g. POST"| T2["Allowed attempts = 1"]
     T1 --> PICK
     T2 --> PICK
-    PICK["Balancer picks a backend that is<br/>alive and not yet tried"] --> F{"Found one?"}
+    PICK["Balancer picks a backend that is healthy,<br/>not ejected, has capacity, not yet tried"] --> F{"Found one?"}
     F -->|"no, and nothing was tried"| E503(["503 Service Unavailable"])
     F -->|"no, but earlier tries failed"| E502(["502 Bad Gateway"])
-    F -->|"yes"| SEND["Forward the request"]
+    F -->|"yes, but this would be a retry"| BUD{"Room in the<br/>retry budget?"}
+    BUD -->|"no"| E502
+    BUD -->|"yes"| SEND
+    F -->|"yes, first attempt"| SEND["Forward the request"]
     SEND --> OK{"Did the backend respond?"}
     OK -->|"yes, any status, even 500"| DONE(["Send that response to the client"])
     OK -->|"no: refused, reset or timed out"| CC{"Is the client still connected?"}
@@ -314,50 +394,64 @@ flowchart TD
     MORE -->|"no"| E502
 ```
 
-The four rules behind this, and why each one exists:
+- **Only retry when no response came back.** A `500` *is* an answer, so it's passed on (and counted against that backend's circuit breaker).
+- **Never retry `POST` or a request with a body.** The first backend may have done the work and crashed before replying; retrying could place an order twice.
+- **Each retry goes to a different backend.**
+- **The retry budget:** over the last 10 seconds, retries may be at most **20% of requests** (with a floor of 10 per second for quiet services). Without it, a broken backend makes every request try three backends, tripling load on the healthy ones exactly when they can least afford it: a *retry storm*.
 
-- **Only retry when no response came back.** If a backend answered with a `500`, that *is* an answer; edgeproxy passes it on. Retrying server errors is a Phase 2 feature with a "retry budget", because blind retries can multiply load on a struggling system (a "retry storm").
-- **Never retry `POST`.** The first backend might have processed the order *and then* crashed before replying. Retrying would place the order twice.
-- **Never retry a request with a body.** The body was already read and sent to the first backend; it can't be replayed.
-- **Each retry goes to a different backend.** Retrying the same dead server is pointless.
+```
+ normal traffic           backend B breaks, no budget        backend B breaks, with budget
+ 100 req/s  →  100        100 req/s → up to 300 attempts      100 req/s → at most 120 attempts
+                          (the healthy backends drown)        (failures stay contained)
+```
 
 ---
 
-## 6. How a backend is chosen (the 3 strategies)
+## 7. How a backend is chosen (5 strategies)
 
-Set with `"strategy"` in the config. All three skip dead backends automatically.
+Set with `"strategy"` in the config. Every strategy skips backends that are unhealthy, ejected, at capacity, or already tried for this request.
 
 ### Round robin (`round_robin`, the default)
 
-Take turns: A, B, C, A, B, C... Simple and fair when every backend is equally fast.
-It uses a single atomic counter (a number many threads can increment safely without locks), so it costs almost nothing per request.
+Take turns: A, B, C, A, B, C... Simple and fair when every backend is equally fast. A single lock-free counter makes it nearly free per request.
 
 ```
 request:   1   2   3   4   5   6   7
 backend:   A   B   C   A   B   C   A
 ```
 
+### Weighted round robin (`weighted_round_robin`)
+
+Like round robin, but a backend with `"weight": 3` gets three times the traffic, for when some machines are bigger. It uses **nginx's smooth algorithm**, which interleaves picks rather than sending bursts:
+
+```
+weights A=5, B=1, C=1   →   A A B A C A A   (not A A A A A B C)
+```
+
 ### Least connections (`least_conn`)
 
-Send the request to whichever backend has the **fewest in-flight requests** right now: the shortest queue at the bank.
-If B is slow, requests pile up on it, its count rises, and new requests flow to A and C instead. Round robin would keep feeding B its full share.
+Send each request to the backend with the **fewest requests in flight**: the shortest queue. If B is slow, requests pile up on it, its count rises, and new requests flow elsewhere.
 
 ```
 in flight now:   A = 3    B = 7 (slow)    C = 2
 next request  →  C
 ```
 
-Ties are broken by starting the scan at a random backend, so ties don't all land on A.
+### Power of two choices (`p2c`)
+
+Pick **two backends at random** and send the request to the less busy of the two. Surprisingly, this gets nearly all of least-connections' benefit, and it avoids a trap: when many proxies all see the same "least loaded" backend, least-connections makes them all pile onto it at once. Random sampling spreads their choices out. Envoy and Twitter's Finagle use it.
+
+```
+sample:  B (7 in flight)  vs  C (2 in flight)   →  C
+```
 
 ### Consistent hashing (`consistent_hash`)
 
-The same **key** (by default the client's IP; or a header such as `X-User-ID`) always goes to the same backend. That's **sticky routing**, useful when a backend caches data for a user.
+The same **key** (the client's IP, or a header such as `X-User-ID`) always goes to the same backend: **sticky routing**, useful when a backend caches data per user.
 
-How it works:
-
-1. Every backend is placed on a "clock face" (the **hash ring**) 128 times, at positions given by hashing `"127.0.0.1:9001#0"`, `"127.0.0.1:9001#1"`, ... These are **virtual nodes**.
+1. Every backend is placed on a "clock face" (the **hash ring**) 128 times, at positions given by hashing its address plus a number. These are **virtual nodes**.
 2. The request's key is hashed onto the same clock.
-3. From that point, walk clockwise to the first virtual node that belongs to an alive backend. That's the one.
+3. From there, walk clockwise to the first virtual node of a usable backend.
 
 ```
                         12 o'clock
@@ -371,7 +465,7 @@ How it works:
                          6 o'clock
 ```
 
-**Why not just `hash(key) % 3`?** Because if a backend dies, `% 3` becomes `% 2` and almost *every* user moves to a different backend, wiping all the caches at once. With a ring, only the dead backend's users move:
+**Why not just `hash(key) % 3`?** If a backend dies, `% 3` becomes `% 2` and almost *every* user moves, wiping every cache at once. With a ring, only the dead backend's users move:
 
 ```mermaid
 flowchart TB
@@ -392,15 +486,23 @@ flowchart TB
     BEFORE ~~~ AFTER
 ```
 
-The test `TestConsistentHashMovesOnlyFailedBackendsKeys` proves this with 20,000 keys: nobody on A or C moves.
+`TestConsistentHashMovesOnlyFailedBackendsKeys` proves this with 20,000 keys.
 
 ---
 
-## 7. Health checking: how a dead server is detected
+## 8. Health checking: active probes and circuit breakers
 
-Every `interval` (2 s in `configs/local.json`), the health checker sends `GET /healthz` to every backend at once. A probe **passes** if the backend answers with a `2xx` status within `timeout`; anything else (an error status, a redirect, no answer, too slow) **fails**.
+edgeproxy finds broken backends two ways, because each catches failures the other misses.
 
-A backend's state only changes after several results agree in a row:
+| | **Active** health checks | **Passive** health checks (outlier detection) |
+|---|---|---|
+| How | Sends `GET /healthz` to every backend every `interval` | Watches the results of real requests |
+| Catches | Dead or unreachable backends, even with no traffic | Backends that answer `/healthz` fine but fail real work (bad deploy, broken database connection) |
+| Speed | Up to one interval × threshold | Immediately after N failures in a row |
+
+### Active: a backend is up or down
+
+A backend's state only changes after several probe results agree in a row:
 
 ```mermaid
 stateDiagram-v2
@@ -413,22 +515,210 @@ stateDiagram-v2
     Down --> Up: healthy_threshold passes in a row
 ```
 
-- **Why thresholds?** One slow probe during a garbage-collection pause shouldn't eject a perfectly good server. Requiring, say, 3 failures in a row prevents **flapping**.
-- **Why does the very first result count immediately?** So that on startup edgeproxy doesn't wait several intervals before sending any traffic. It also probes all backends *before* opening port 8080, so the first users never hit a dead server.
-- **Active vs. passive checks.** This is *active* checking: edgeproxy goes and asks. Phase 2 adds *passive* checking: noticing real requests failing and ejecting the backend straight away, without waiting for the next probe.
+Thresholds stop one slow probe from ejecting a good server (**flapping**). The first result counts immediately, and edgeproxy probes everything *before* opening its port, so the first users never hit a dead server.
 
-Each state change is written to the log:
+### Passive: a circuit breaker per backend
 
-```json
-{"level":"WARN","msg":"backend is down","backend":"127.0.0.1:9001","error":"health check returned status 503"}
-{"level":"INFO","msg":"backend is up","backend":"127.0.0.1:9001"}
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Closed: request succeeds
+    Closed --> Open: consecutive_failures in a row (5xx or no response)
+    Open --> HalfOpen: ejection time passes
+    HalfOpen --> Closed: next request succeeds
+    HalfOpen --> Open: next request fails, ejected for twice as long
 ```
+
+- **Closed** (normal): traffic flows. Failures in a row are counted; any success resets the count.
+- **Open** (ejected): no traffic at all for the ejection time: 10 s the first time, doubling on each repeat up to 5 minutes.
+- **Half-open** (on trial): traffic is allowed again; a single failure re-ejects it immediately.
+- **Safety valve:** at most `max_ejection_percent` (50%) of backends can be ejected at once. If a bad deploy hits *every* backend, ejecting them all would turn "some errors" into "total outage", so edgeproxy keeps serving instead.
+
+`/backends` shows both views, e.g. `"alive": true, "outlier": "ejected"` = passing probes but failing real traffic.
 
 ---
 
-## 8. Shutting down without dropping requests
+## 9. Rate limiting
 
-When you deploy a new version, the old process is told to stop. Done badly, users in the middle of a request get errors. edgeproxy does it in stages:
+A rate limit caps how many requests one client may send. It protects your
+servers from abusive or buggy clients, and expensive endpoints (like login)
+from brute-force attacks. Rules are checked in order and the first match applies:
+
+```json
+"rules": [
+  { "name": "login", "path_prefix": "/login", "methods": ["POST"], "limit": 5, "window": "1m" },
+  { "name": "api",   "path_prefix": "/",      "limit": 100, "window": "1s", "key": "header:X-API-Key" }
+]
+```
+
+Over the limit, the client gets `429 Too Many Requests` with a `Retry-After`
+header; every limited response also carries `RateLimit-Limit`,
+`RateLimit-Remaining` and `RateLimit-Reset`, so well-behaved clients can slow
+down before they're cut off.
+
+### Two algorithms
+
+**In memory (one proxy):** a **token bucket** per client.
+
+```
+ capacity 5, refills 5 per minute (one every 12 s)
+
+ [● ● ● ● ●]  full            each request takes one token
+ [● ● ●    ]  2 requests      a token drips back every 12 s
+ [         ]  empty → 429     Retry-After: 12
+```
+
+Buckets live in 16 separately locked shards (so concurrent requests rarely
+wait on each other), and each shard forgets its least recently used clients
+when full, so memory stays bounded however many clients appear.
+
+**In Redis (every proxy shares the limit):** a **sliding window counter**.
+Time is cut into fixed windows; "requests in the last minute" is estimated as
+this window's count plus the previous window's count, weighted by how much of
+it still overlaps:
+
+```
+        previous minute: 10 requests  │  this minute: 4 so far
+   ───────────────────────────────────┼───────────────────
+                     ◄──── 25% ─────► │ ◄──── 75% ────►   now is 45 s into the minute
+                       still overlaps │
+   estimated count = 10 × 0.25 + 4 = 6.5
+```
+
+The read-check-increment runs as one **Lua script inside Redis**, so it's
+atomic: two proxies can never both take the last allowed request.
+
+### What happens when Redis goes down
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant E as edgeproxy
+    participant R as Redis
+    participant L as Local token buckets
+
+    C->>E: GET /api/items
+    E->>R: run the sliding-window Lua script
+    R-->>E: allowed, 57 remaining
+    E-->>C: forwarded, RateLimit-Remaining 57
+
+    Note over R: Redis crashes
+    C->>E: GET /api/items
+    E-xR: no answer within 50 ms
+    Note over E: on_redis_error = local
+    E->>L: check this instance's own bucket
+    L-->>E: allowed
+    E-->>C: forwarded (limit now enforced per instance)
+    Note over E: fallback metric rises, alert fires
+```
+
+`on_redis_error` picks the trade-off: `local` (default: still limited, just
+per instance), `allow` (fail open: availability first), or `deny` (fail
+closed: protection first). The chaos test stops Redis under load: zero
+requests failed.
+
+---
+
+## 10. Changing config without a restart
+
+Edit the config file and edgeproxy notices within `reload_interval` (2 s);
+or send `SIGHUP`; or `POST /-/reload` on the admin port.
+
+```mermaid
+sequenceDiagram
+    participant O as Operator
+    participant E as edgeproxy
+    participant N as New backend D
+
+    O->>E: edit config: add backend D
+    Note over E: notices the file changed
+    E->>E: parse and validate
+    alt config is invalid
+        E-->>O: reload fails, logged and counted, old config keeps running
+    else config is valid
+        E->>N: GET /healthz (probe before any traffic)
+        N-->>E: 200 OK
+        E->>E: build a new pool, swap it in atomically
+        Note over E: requests already in flight finish on the old pool,<br/>new ones use the new pool, nothing is dropped
+    end
+```
+
+Backends that exist in both the old and new config keep their health and
+circuit-breaker state. Backends, weights, strategy, health checks, outlier
+detection, retries and rate-limit rules all reload live; a few settings
+(listen addresses, timeouts, TLS, tracing) need a restart, and edgeproxy logs
+which ones you changed.
+
+**DNS service discovery** uses the same mechanism: list a DNS name under
+`discovery.dns` and edgeproxy re-resolves it every few seconds, turning each IP
+address into a backend. In Kubernetes, point it at a *headless* Service and it
+finds every pod automatically. Addresses are sorted, so the hash ring stays
+stable, and a failed DNS lookup keeps the last known addresses rather than
+emptying the pool.
+
+---
+
+## 11. Seeing inside: metrics, logs and traces
+
+The three ways to see what a running system is doing, and the question each answers:
+
+| Tool | Answers | Where |
+|---|---|---|
+| **Metrics** (Prometheus, Grafana) | "How is the system doing overall?" Rates, error ratios, p99 latency, health | `:9090/metrics`, Grafana dashboard |
+| **Access logs** (JSON) | "What happened to *this* request?" | stdout, one line per request |
+| **Traces** (OpenTelemetry, Jaeger) | "Where did the time go for this request?" | Jaeger UI |
+
+All three share the **request ID** and **trace ID**, so you can jump from a
+spike on a graph, to the log lines, to the exact trace.
+
+An access log line:
+
+```json
+{"msg":"request","method":"GET","path":"/hello","status":200,"duration_ms":1.8,"bytes":57,
+ "backend":"10.0.0.7:8080","attempts":1,"request_id":"9f2c4e...","client_ip":"203.0.113.9","trace_id":"4bf92f..."}
+```
+
+(The query string is never logged; it often carries tokens.)
+
+A trace, as Jaeger shows it, for a request whose first attempt failed:
+
+```mermaid
+flowchart LR
+    T["Trace 4bf92f…"] --> S1["GET (server span)<br/>whole request in edgeproxy<br/>status 200, attempts 2"]
+    S1 --> A1["proxy to backend A<br/>attempt 1: error,<br/>connection refused"]
+    S1 --> A2["proxy to backend B<br/>attempt 2: 200"]
+    A2 --> BS["Backend B's own spans<br/>joined through the<br/>traceparent header"]
+```
+
+The Grafana dashboard ([deploy/grafana](deploy/grafana/dashboards/edgeproxy.json))
+shows RED metrics (Rate, Errors, Duration) per backend, backend health,
+retries, rate limiting and Go runtime stats. Prometheus alert rules
+([deploy/prometheus/alerts.yml](deploy/prometheus/alerts.yml)) follow Google's
+SRE-workbook **multi-window burn-rate** pattern for a 99.9% availability SLO,
+and come with unit tests.
+
+---
+
+## 12. HTTPS (TLS)
+
+Set `tls.cert_file` and `tls.key_file` and the public listener speaks HTTPS,
+with HTTP/2 negotiated automatically and TLS 1.2 as the minimum (or 1.3 only).
+
+```mermaid
+flowchart LR
+    C["Client"] -->|"HTTPS, encrypted<br/>HTTP/2"| E["edgeproxy<br/>decrypts here"]
+    E -->|"plain HTTP<br/>on the private network"| B["Backends"]
+    C2["Old link: http://"] -->|"plain HTTP"| R["redirect_listen :80"]
+    R -->|"308 to https://"| C2
+```
+
+- **Certificate rotation without a restart:** certificates expire (often every 90 days). edgeproxy re-reads the files every `reload_interval`, so a renewed certificate (from cert-manager or certbot) is served to new connections immediately. A broken renewal is logged and the old certificate stays in use.
+- `tls.redirect_listen` (e.g. `":80"`) answers plain HTTP with a `308` redirect to the HTTPS address.
+- `edgeproxy -gen-cert ./certs` writes a self-signed localhost certificate for trying it out.
+
+---
+
+## 13. Shutting down without dropping requests
 
 ```mermaid
 sequenceDiagram
@@ -447,79 +737,137 @@ sequenceDiagram
 ```
 
 1. **Signal arrives** (`SIGTERM` or Ctrl+C).
-2. **`/readyz` starts returning `503`.** Whatever sits in front of edgeproxy (a cloud load balancer, a Kubernetes Service) checks readiness regularly, sees the 503 and stops routing new users here.
-3. **Wait `drain_delay`.** The thing in front needs a few seconds to notice. Meanwhile edgeproxy keeps serving normally. (0 s locally, since nothing is in front; around 5–10 s in Kubernetes.)
-4. **Close the doors and finish up.** Stop accepting new connections and give in-flight requests up to `shutdown_grace` (15 s) to complete.
-5. **Exit.**
+2. **`/readyz` starts returning `503`**, so whatever sits in front stops routing new users here.
+3. **Wait `drain_delay`** while it notices (0 s locally; ~5 s in Kubernetes). edgeproxy keeps serving normally meanwhile.
+4. **Close the doors and finish up:** stop accepting connections; in-flight requests get up to `shutdown_grace` (15 s).
+5. **Exit.** `TestGracefulShutdownFinishesInflightRequests` proves a request in progress during shutdown still gets its `200`.
 
 ---
 
-## 9. Where each piece lives in the code
+## 14. Where each piece lives in the code
 
 ```mermaid
-flowchart TD
-    MAIN["cmd/edgeproxy<br/>main.go: wiring and shutdown<br/>admin.go: port 9090 endpoints"]
-    CFG["internal/config<br/>load and validate the JSON file"]
-    PX["internal/proxy<br/>forward, retry, connection pool"]
-    HC["internal/health<br/>background probes"]
-    BAL["internal/balancer<br/>the 3 strategies"]
-    MET["internal/metrics<br/>Prometheus counters and gauges"]
-    BE["internal/backend<br/>one backend: URL, alive flag, in-flight count"]
+flowchart LR
+    MAIN["cmd/edgeproxy<br/>wiring, reload, discovery,<br/>admin endpoints, shutdown"]
+    CFG["internal/config<br/>load and validate"]
+    OBS["internal/observe<br/>request IDs, access logs, tracing"]
+    RL["internal/ratelimit<br/>token buckets, Redis sliding window"]
+    PX["internal/proxy<br/>forward, retry, retry budget"]
+    HC["internal/health<br/>active probes"]
+    OD["internal/outlier<br/>circuit breakers"]
+    BAL["internal/balancer<br/>5 strategies"]
+    TLS["internal/tlsutil<br/>HTTPS, cert rotation"]
+    MET["internal/metrics<br/>Prometheus"]
+    KEY["internal/reqkey<br/>client IP / header keys"]
+    BE["internal/backend<br/>one backend's state"]
 
     MAIN --> CFG
+    MAIN --> OBS
+    MAIN --> RL
     MAIN --> PX
     MAIN --> HC
-    MAIN --> BAL
-    MAIN --> MET
+    MAIN --> TLS
     PX --> BAL
+    PX --> OD
     PX --> MET
-    PX --> BE
+    RL --> KEY
+    BAL --> KEY
     HC --> BE
     BAL --> BE
-    MET --> BE
+    OD -.-> BE
+    PX --> BE
 ```
 
-An arrow means "uses". Everything points down towards `backend`, the shared piece of state.
+An arrow means "uses". Everything funnels down to `backend`, the shared state.
 
-| File | What it does |
+| Path | What it does |
 |---|---|
-| [cmd/edgeproxy/main.go](cmd/edgeproxy/main.go) | Reads config, builds every piece, runs the first health check, starts both listeners, handles shutdown. |
-| [cmd/edgeproxy/admin.go](cmd/edgeproxy/admin.go) | The port-9090 endpoints: `/metrics`, `/healthz`, `/readyz`, `/backends`. |
-| [cmd/demobackend/main.go](cmd/demobackend/main.go) | A toy backend for testing. Can add latency, fail a percentage of requests, and toggle its own health. |
-| [internal/backend/backend.go](internal/backend/backend.go) | One backend's URL, its alive flag and its in-flight counter. Uses atomics (thread-safe numbers) because the proxy and health checker touch them at the same time. |
-| [internal/balancer/roundrobin.go](internal/balancer/roundrobin.go) | Round robin. |
-| [internal/balancer/leastconn.go](internal/balancer/leastconn.go) | Least connections. |
-| [internal/balancer/consistenthash.go](internal/balancer/consistenthash.go) | Hash ring with 128 virtual nodes per backend, and the hash-key options. |
-| [internal/health/checker.go](internal/health/checker.go) | Probes, thresholds, up/down logging. |
-| [internal/proxy/proxy.go](internal/proxy/proxy.go) | The request handler: the logic in sections 4 and 5, plus the tuned connection pool. |
-| [internal/metrics/metrics.go](internal/metrics/metrics.go) | Defines every Prometheus metric. |
-| [internal/config/config.go](internal/config/config.go) | Defaults, loading, and validation of the config file. |
-| `*_test.go` | Unit tests, next to the code they test. |
-| [e2e/](e2e/) | End-to-end tests that run the real binaries ([section 13](#13-continuous-integration)). |
+| [cmd/edgeproxy/main.go](cmd/edgeproxy/main.go) | Reads config, builds every piece, stacks the middleware, starts the listeners, handles shutdown. |
+| [cmd/edgeproxy/reload.go](cmd/edgeproxy/reload.go) | Hot reload: file watching, SIGHUP, building and swapping pools, cert rotation. |
+| [cmd/edgeproxy/discovery.go](cmd/edgeproxy/discovery.go) | DNS service discovery. |
+| [cmd/edgeproxy/admin.go](cmd/edgeproxy/admin.go) | The port-9090 endpoints. |
+| [cmd/demobackend](cmd/demobackend/main.go) | A toy backend: adds latency, fails a share of requests, toggles its own health, echoes what it received. |
+| [internal/proxy](internal/proxy/proxy.go) | The request handler, retries, [retry budget](internal/proxy/budget.go), connection pool, per-attempt spans. |
+| [internal/balancer](internal/balancer/) | [Round robin](internal/balancer/roundrobin.go), [weighted](internal/balancer/weighted.go), [least conn](internal/balancer/leastconn.go), [P2C](internal/balancer/p2c.go), [consistent hash](internal/balancer/consistenthash.go). |
+| [internal/health](internal/health/checker.go) | Active health checks. |
+| [internal/outlier](internal/outlier/outlier.go) | Passive health checks: per-backend circuit breakers. |
+| [internal/ratelimit](internal/ratelimit/) | [Rules and middleware](internal/ratelimit/ratelimit.go), [local token buckets](internal/ratelimit/local.go), [Redis sliding window](internal/ratelimit/redis.go). |
+| [internal/observe](internal/observe/) | Request IDs, [access log](internal/observe/accesslog.go), [tracing](internal/observe/tracing.go). |
+| [internal/tlsutil](internal/tlsutil/tlsutil.go) | TLS config, certificate rotation, HTTPS redirect. |
+| [internal/config](internal/config/config.go) | Defaults, parsing, validation (and a [fuzz test](internal/config/fuzz_test.go)). |
+| [internal/metrics](internal/metrics/metrics.go), [internal/backend](internal/backend/backend.go), [internal/reqkey](internal/reqkey/reqkey.go) | Metric definitions; one backend's state; who-sent-this keys. |
+| [e2e/](e2e/) | End-to-end tests running the real binaries. |
+| [deploy/](deploy/) | Compose config, Prometheus rules, Grafana dashboard, Kubernetes manifests. |
+| [loadtest/](loadtest/k6/load.js), [scripts/](scripts/) | k6 load test, chaos test, benchmark, local CI. |
 
 ---
 
-## 10. Run it locally
+## 15. Run it
 
-You need **Go 1.26 or newer** ([download](https://go.dev/dl/)).
+### Option A: the whole system with Docker (recommended)
 
-Download dependencies, then run the tests:
+You need **Docker** (Docker Desktop on Windows/macOS).
 
 ```bash
-go mod tidy
+docker compose up -d --build
+```
+
+That starts all of this:
+
+```mermaid
+flowchart TB
+    YOU["You: curl, browser, k6"] --> E1["edgeproxy-1<br/>:8080, admin :9090"]
+    YOU --> E2["edgeproxy-2<br/>:8081, admin :9091"]
+    E1 --> BA["backend-a"]
+    E1 --> BB["backend-b"]
+    E1 --> TX["toxiproxy<br/>injects faults"]
+    E2 --> BA
+    E2 --> BB
+    E2 --> TX
+    TX --> BC["backend-c"]
+    E1 <--> RD[("redis<br/>shared rate limits")]
+    E2 <--> RD
+    E1 -.-> JG["jaeger :16686<br/>traces"]
+    E2 -.-> JG
+    PR["prometheus :9095<br/>+ alert rules"] -.->|"scrapes"| E1
+    PR -.->|"scrapes"| E2
+    GR["grafana :3000<br/>dashboard"] -.-> PR
+```
+
+| Open | To see |
+|---|---|
+| http://localhost:3000 | The Grafana dashboard (send some traffic first) |
+| http://localhost:16686 | Traces in Jaeger |
+| http://localhost:9095/alerts | Prometheus alert rules and their state |
+| http://localhost:9090/backends | edgeproxy-1's view of each backend |
+
+Send traffic, then load-test and break things:
+
+```bash
+curl -s localhost:8080/hello
 ```
 
 ```bash
-go test ./...
+docker compose run --rm k6 run /scripts/load.js
 ```
-
-Run the end-to-end tests, which start the real binaries ([section 13](#13-continuous-integration)):
 
 ```bash
-go test -tags e2e -v ./e2e/
+scripts/chaos.sh
 ```
 
-Start three demo backends, each in its own terminal. `b` is slow and `c` fails 10% of requests, so there's something to see:
+```bash
+RATE=3000 DURATION=20s scripts/bench.sh
+```
+
+Stop it all:
+
+```bash
+docker compose down
+```
+
+### Option B: just the Go programs
+
+You need **Go 1.26 or newer** ([download](https://go.dev/dl/)). Start three demo backends, each in its own terminal (`b` is slow, `c` fails 10% of requests):
 
 ```bash
 go run ./cmd/demobackend -addr :9001 -name a
@@ -533,13 +881,11 @@ go run ./cmd/demobackend -addr :9002 -name b -latency 50ms
 go run ./cmd/demobackend -addr :9003 -name c -fail-rate 0.1
 ```
 
-Start the proxy in a fourth terminal:
+Then the proxy:
 
 ```bash
 go run ./cmd/edgeproxy -config configs/local.json
 ```
-
-Send some traffic. Run this a few times and watch `"backend"` rotate through a, b, c:
 
 ```bash
 curl -s localhost:8080/hello
@@ -547,162 +893,211 @@ curl -s localhost:8080/hello
 
 ### Experiments to try
 
-| Try this | What you'll see | Which section explains it |
+| Try this | What you'll see | Section |
 |---|---|---|
-| `curl -X POST localhost:9001/toggle-health`, wait 4 s, then `curl -s localhost:9090/backends` | Backend a shows `"alive": false`, and traffic only goes to b and c | [7](#7-health-checking-how-a-dead-server-is-detected) |
-| Press Ctrl+C in backend b's terminal, then send several `curl`s | Every request still succeeds: the proxy retries on another backend | [4](#4-life-of-a-request-step-by-step), [5](#5-when-does-it-retry) |
-| Change `"strategy"` to `"consistent_hash"`, restart the proxy, run `curl -s -H "X-User-ID: 42" localhost:8080/` repeatedly | The same backend every time. Change 42 to 43 and you may get a different one | [6](#6-how-a-backend-is-chosen-the-3-strategies) |
-| `curl -s localhost:9090/metrics \| grep edgeproxy_` | The live counters | [12](#12-admin-endpoints-and-metrics) |
-| `curl -s -H "X-Forwarded-For: 6.6.6.6" localhost:8080/` | `x_forwarded_for` shows your real IP, not 6.6.6.6 | [2](#observability) |
+| `curl -X POST localhost:9001/toggle-health`, wait 4 s, `curl -s localhost:9090/backends` | Backend a shows `"alive": false`; traffic skips it | [8](#8-health-checking-active-probes-and-circuit-breakers) |
+| Ctrl+C backend b's terminal, then send several `curl`s | Every request still succeeds via retries | [5](#5-life-of-a-request-when-a-backend-has-just-crashed) |
+| Start a backend with `-fail-rate 1` and send 20 requests | `/backends` shows it `"outlier": "ejected"` while `"alive"` is still true | [8](#8-health-checking-active-probes-and-circuit-breakers) |
+| Change `"strategy"` in the config file and save | The log says `config reloaded`; no restart | [10](#10-changing-config-without-a-restart) |
+| `curl -s -X POST localhost:8080/login` six times quickly | The 6th gets `429` with `Retry-After` | [9](#9-rate-limiting) |
+| `curl -si localhost:8080/hello` | The response has an `X-Request-ID`; find it in the proxy's log | [11](#11-seeing-inside-metrics-logs-and-traces) |
+| `curl -s -H "X-Forwarded-For: 6.6.6.6" localhost:8080/` | The backend sees your real IP, not 6.6.6.6 | [2](#observability-and-security) |
+| `go run ./cmd/edgeproxy -check -config configs/local.json` | Validates a config without starting anything | [16](#16-config-file-every-field-explained) |
+
+### Option C: Kubernetes
+
+[deploy/k8s](deploy/k8s/) has production-style manifests:
+
+```mermaid
+flowchart TB
+    USERS["Users"] --> SVC["Service edgeproxy<br/>port 80"]
+    SVC --> P1["edgeproxy pod 1"]
+    SVC --> P2["edgeproxy pod 2"]
+    HPA["HorizontalPodAutoscaler<br/>2 to 10 pods on CPU"] -.-> DEP["Deployment edgeproxy<br/>rolling updates, maxUnavailable 0"]
+    DEP -.-> P1
+    DEP -.-> P2
+    P1 -->|"DNS discovery"| HS["Headless Service demobackend<br/>resolves to every pod IP"]
+    P2 -->|"DNS discovery"| HS
+    HS --> D1["backend pod"]
+    HS --> D2["backend pod"]
+    HS --> D3["backend pod"]
+```
+
+Readiness probes gate traffic (and fail during draining), a
+PodDisruptionBudget keeps a replica up during node maintenance, and containers
+run as non-root with a read-only filesystem and no Linux capabilities. With a
+local [kind](https://kind.sigs.k8s.io/) cluster:
+
+```bash
+docker build -t edgeproxy:local . && docker build -t demobackend:local --build-arg TARGET=demobackend .
+```
+
+```bash
+kind load docker-image edgeproxy:local demobackend:local
+```
+
+```bash
+kubectl apply -k deploy/k8s
+```
 
 ---
 
-## 11. Config file, every field explained
+## 16. Config file, every field explained
 
-The config is JSON. Any field you leave out uses its default. A misspelled field name is rejected at startup with an error, rather than silently ignored.
+JSON; any field you leave out uses its default. Misspelled field names are rejected at startup.
+Durations are strings: `"250ms"`, `"5s"`, `"1m"`. Validate a file with `edgeproxy -check -config FILE`.
+
+### Core
 
 | Field | Default | Meaning |
 |---|---|---|
-| `listen` | `":8080"` | Address and port the public listener accepts client traffic on. `":8080"` means every network interface, port 8080. |
-| `admin_listen` | `":9090"` | Address and port for the admin endpoints. Must differ from `listen`. |
-| `strategy` | `"round_robin"` | `round_robin`, `least_conn` or `consistent_hash` ([section 6](#6-how-a-backend-is-chosen-the-3-strategies)). |
-| `hash_key` | `"client_ip"` | Only used by `consistent_hash`. `"client_ip"` hashes on the caller's IP; `"header:X-User-ID"` hashes on that header (falling back to IP when it's missing). |
+| `listen` | `":8080"` | Address for client traffic. |
+| `admin_listen` | `":9090"` | Address for the admin endpoints. Must differ from `listen`. |
+| `backends` | (required unless discovery is set) | Backend URLs, as strings or `{"url": "...", "weight": 3}` objects. |
+| `strategy` | `"round_robin"` | `round_robin`, `weighted_round_robin`, `least_conn`, `p2c` or `consistent_hash`. |
+| `hash_key` | `"client_ip"` | For `consistent_hash`: `"client_ip"` or `"header:X-User-ID"`. |
 | `max_retries` | `2` | How many *other* backends a failed safe request may be retried on (0–10). |
-| `backends` | (required) | List of backend URLs, e.g. `"http://127.0.0.1:9001"`. |
-| `health_check.path` | `"/healthz"` | Path probed on each backend. |
-| `health_check.interval` | `"5s"` | Time between probe rounds. |
-| `health_check.timeout` | `"1s"` | A probe slower than this fails. Must not exceed `interval`. |
-| `health_check.healthy_threshold` | `2` | Passes in a row needed to mark a down backend up. |
-| `health_check.unhealthy_threshold` | `3` | Failures in a row needed to mark an up backend down. |
+| `max_inflight_per_backend` | `0` | Stop sending to a backend with this many requests in flight (0 = no cap). |
+| `reload_interval` | `"2s"` | How often the config and TLS files are checked for changes (0 disables watching). |
+| `access_log` | `true` | One JSON line per request. |
+
+### `health_check` (active)
+
+| Field | Default | Meaning |
+|---|---|---|
+| `path` | `"/healthz"` | Path probed on each backend. |
+| `interval` | `"5s"` | Time between probe rounds. |
+| `timeout` | `"1s"` | A probe slower than this fails. |
+| `healthy_threshold` | `2` | Passes in a row to mark a down backend up. |
+| `unhealthy_threshold` | `3` | Failures in a row to mark an up backend down. |
+
+### `outlier_detection` (passive)
+
+| Field | Default | Meaning |
+|---|---|---|
+| `consecutive_failures` | `5` | Eject after this many failed requests in a row (0 disables). |
+| `base_ejection_time` | `"10s"` | First ejection length; doubles on each repeat. |
+| `max_ejection_time` | `"5m"` | Cap on ejection length. |
+| `max_ejection_percent` | `50` | Never eject more than this share of backends at once. |
+
+### `retry_budget`
+
+| Field | Default | Meaning |
+|---|---|---|
+| `ratio` | `0.2` | Retries in the last 10 s may be at most this share of requests. |
+| `min_retries_per_second` | `10` | ...or this many per second, whichever is larger. |
+
+### `rate_limit`
+
+| Field | Default | Meaning |
+|---|---|---|
+| `rules[]` | none | Each: `name`, `path_prefix`, optional `methods`, `limit`, `window`, `key` (`client_ip` or `header:Name`). First match wins. |
+| `redis.addr` | `""` | Redis `host:port`; empty means limits are per instance, in memory. |
+| `redis.password_env` | `""` | Name of the environment variable holding the Redis password (never put it in the file). |
+| `redis.db` / `redis.key_prefix` | `0` / `"edgeproxy:rl:"` | Redis database and key namespace. |
+| `redis.timeout` | `"50ms"` | Give up on Redis after this long and apply `on_redis_error`. |
+| `on_redis_error` | `"local"` | `local`, `allow` or `deny` ([section 9](#9-rate-limiting)). |
+| `max_keys` | `100000` | Most clients the in-memory limiter tracks. |
+
+### `tracing`, `tls`, `discovery`, `timeouts`
+
+| Field | Default | Meaning |
+|---|---|---|
+| `tracing.enabled` | `false` | Export OpenTelemetry traces. |
+| `tracing.endpoint` / `insecure` | `"localhost:4318"` / `true` | OTLP/HTTP collector address; `insecure` uses plain HTTP. |
+| `tracing.sample_ratio` | `1` | Share of new traces kept (a caller's own sampling decision is respected). |
+| `tracing.service_name` | `"edgeproxy"` | Name shown in Jaeger. |
+| `tls.cert_file` / `key_file` | `""` | PEM certificate and key; set both to serve HTTPS. |
+| `tls.min_version` | `"1.2"` | `"1.2"` or `"1.3"`. |
+| `tls.redirect_listen` | `""` | Plain-HTTP address that redirects to HTTPS, e.g. `":80"`. |
+| `discovery.dns[]` | none | Each: `host`, `port`, `scheme` (`http`/`https`); every address the name resolves to becomes a backend. |
+| `discovery.interval` | `"10s"` | How often to re-resolve. |
 | `timeouts.dial` | `"2s"` | Max time to open a TCP connection to a backend. |
-| `timeouts.read_header` | `"5s"` | Max time a client gets to send its request headers. Stops a "slowloris" attack, where a client opens many connections and sends headers one byte at a time to tie the server up. |
+| `timeouts.read_header` | `"5s"` | Max time a client gets to send its headers (stops "slowloris" attacks, where a client ties up connections by sending headers one byte at a time). |
 | `timeouts.response_header` | `"10s"` | Max time a backend gets to *start* answering. |
-| `timeouts.idle_conn` | `"90s"` | How long an unused pooled connection to a backend is kept open. |
-| `timeouts.drain_delay` | `"0s"` | How long to keep serving after `SIGTERM` while `/readyz` reports 503 ([section 8](#8-shutting-down-without-dropping-requests)). |
+| `timeouts.idle_conn` | `"90s"` | How long an unused pooled connection is kept. |
+| `timeouts.drain_delay` | `"0s"` | How long to keep serving after `SIGTERM` while `/readyz` reports 503. |
 | `timeouts.shutdown_grace` | `"15s"` | Max time in-flight requests get to finish during shutdown. |
 
-Durations are strings: `"250ms"`, `"5s"`, `"1m"`.
+See [configs/local.json](configs/local.json), [deploy/compose/edgeproxy.json](deploy/compose/edgeproxy.json) and the ConfigMap in [deploy/k8s/edgeproxy.yaml](deploy/k8s/edgeproxy.yaml) for complete examples.
 
 ---
 
-## 12. Admin endpoints and metrics
+## 17. Admin endpoints and metrics
 
-All on port 9090.
+On the admin port (9090), never the public one:
 
 | Endpoint | Answers | Used by |
 |---|---|---|
-| `GET /healthz` | `200 ok` whenever the process is running | **Liveness** probe: restart edgeproxy if this fails |
-| `GET /readyz` | `200 ready`, or `503` while draining or when no backend is alive | **Readiness** probe: stop sending traffic here if this fails |
-| `GET /backends` | JSON list of every backend with `alive` and `inflight` | Humans debugging |
-| `GET /metrics` | Every metric in Prometheus text format | Prometheus scraping |
-
-### The metrics
+| `GET /healthz` | `200 ok` while the process runs | Liveness probe |
+| `GET /readyz` | `200 ready`, or `503` while draining or with no healthy backend | Readiness probe |
+| `GET /backends` | JSON per backend: `alive`, `outlier` state, `inflight`, `weight` | Humans debugging |
+| `POST /-/reload` | Re-reads config and certificates; `400` with the reason if the new config is invalid | Operators, deploy scripts |
+| `GET /metrics` | Prometheus metrics | Prometheus |
 
 | Metric | Type | What it tells you |
 |---|---|---|
-| `edgeproxy_requests_total{backend, code}` | counter | Requests finished, by which backend answered and the status code. Divide 5xx by total for your **error rate**. |
-| `edgeproxy_request_duration_seconds{backend}` | histogram | How long requests took, end to end including retries. Use it for **p50 / p99 latency**. |
-| `edgeproxy_upstream_errors_total{backend}` | counter | Times a backend couldn't be reached at all (refused, reset, timed out). |
-| `edgeproxy_retries_total` | counter | Attempts made on a second or third backend. A sudden rise means a backend is failing. |
-| `edgeproxy_backend_up{backend}` | gauge | `1` = passing health checks, `0` = down. Alert if every backend is `0`. |
-| `edgeproxy_backend_inflight_requests{backend}` | gauge | Requests that backend is handling right now. One backend much higher than the others = it's slow. |
+| `edgeproxy_requests_total{backend, code}` | counter | Requests finished, by backend and status. 5xx ÷ total = **error rate**. |
+| `edgeproxy_request_duration_seconds{backend}` | histogram | End-to-end latency, for **p50 / p99**. |
+| `edgeproxy_upstream_errors_total{backend}` | counter | Times a backend couldn't be reached at all. |
+| `edgeproxy_retries_total` | counter | Attempts on a second or third backend. |
+| `edgeproxy_retry_budget_exhausted_total` | counter | Retries refused because the budget was empty. |
+| `edgeproxy_outlier_ejections_total{backend}` | counter | Circuit-breaker ejections. |
+| `edgeproxy_backend_up{backend}` | gauge | `1` = passing active health checks. |
+| `edgeproxy_backend_ejected{backend}` | gauge | `1` = ejected by outlier detection. |
+| `edgeproxy_backend_inflight_requests{backend}` | gauge | Requests in progress on that backend. |
+| `edgeproxy_rate_limited_total{rule}` | counter | Requests rejected with 429, by rule. |
+| `edgeproxy_rate_limit_fallbacks_total` | counter | Times Redis failed and `on_redis_error` was applied. |
+| `edgeproxy_config_reloads_total{result}` | counter | Reloads by `success` / `failure`. |
 
-Labels in `{braces}` split a metric into separate series; `backend="127.0.0.1:9001"` is one series per backend. `backend="none"` appears on 503s, where no backend was available.
-
-There are also standard Go runtime metrics (`go_*`, `process_*`): memory, goroutines, CPU.
+`backend="none"` appears on 503s where no backend was available. Standard Go
+runtime metrics (`go_*`, `process_*`) are included too.
 
 ---
 
-## 13. Continuous integration
+## 18. Testing and CI
 
-**CI (continuous integration)** means every change is automatically built and
-tested by a server, so a broken change is caught before anyone relies on it.
-Every push to `main` and every pull request runs
-[.github/workflows/ci.yml](.github/workflows/ci.yml) on a fresh Linux machine,
-in three stages:
+Five kinds of tests, from smallest to biggest:
+
+| Kind | What it checks | Where |
+|---|---|---|
+| **Unit tests** | One piece alone, e.g. "does smooth weighted round robin produce A A B A C A A?" | `*_test.go` next to the code |
+| **Fuzz test** | Random mutations of real configs never crash the parser or slip past validation | [internal/config/fuzz_test.go](internal/config/fuzz_test.go) |
+| **End-to-end tests** | The real binaries as separate processes, over real HTTP: balancing, failover, ejection, retries, rate limits (against real Redis), reload, discovery, request IDs, tracing, TLS, graceful shutdown | [e2e/](e2e/) |
+| **Load test** | 1,000 req/s through the full Docker stack stays under 0.1% errors and 250 ms p99 | [loadtest/k6/load.js](loadtest/k6/load.js) |
+| **Chaos test** | The same, while a backend is killed, another slowed by 500 ms, and Redis stopped | [scripts/chaos.sh](scripts/chaos.sh) |
+
+Every push runs them all in [GitHub Actions](.github/workflows/ci.yml):
 
 ```mermaid
 flowchart LR
-    PUSH(["git push or pull request"]) --> LINT
-    PUSH --> UNIT
-    subgraph S1["Stage 1: run side by side"]
-        LINT["Lint<br/>formatting, go.mod tidy,<br/>go vet, build"]
-        UNIT["Unit tests<br/>each package on its own,<br/>race detector, coverage"]
-    end
-    LINT --> E2E
+    PUSH(["git push"]) --> LINT["Lint<br/>gofmt, vet, staticcheck,<br/>govulncheck, build"]
+    PUSH --> UNIT["Unit tests<br/>race detector, coverage,<br/>30 s of fuzzing"]
+    PUSH --> CONF["Deploy configs<br/>promtool rule tests,<br/>kubeconform, -check"]
+    LINT --> E2E["End-to-end tests<br/>real binaries + real Redis"]
     UNIT --> E2E
-    subgraph S2["Stage 2: only if both pass"]
-        E2E["End-to-end tests<br/>real edgeproxy + real backends<br/>talking over real HTTP"]
-    end
-    E2E --> OK(["Green tick on the commit"])
+    E2E --> SYS["Load and chaos tests<br/>full Docker stack + k6"]
+    CONF --> SYS
+    SYS --> OK(["Green tick"])
 ```
 
-### Stage 1a: Lint (is the code well-formed?)
+- **Race detector:** CI builds tests *and* the e2e binaries with `-race`, which catches two goroutines (Go's lightweight threads) touching the same memory unsafely.
+- **govulncheck** fails the build if a known vulnerability is reachable from the code, in the standard library or any dependency.
+- Run everything locally (works on Windows too, through Docker):
 
-| Step | What it catches |
-|---|---|
-| `gofmt -l .` | Code that isn't in Go's standard formatting |
-| `go mod tidy` + `git diff` | `go.mod` / `go.sum` out of date with the imports |
-| `go vet -tags e2e ./...` | Common mistakes the compiler allows (wrong format strings, copied locks, ...), including in the e2e tests |
-| `go build ./...` | Anything that doesn't compile |
-
-### Stage 1b: Unit tests (does each piece work alone?)
-
-A **unit test** checks one small piece in isolation, e.g. "given these
-backends, does round robin cycle A, B, C?", without starting the whole program.
-
-- `go test -race ./...` runs every `*_test.go` next to the code.
-- The **race detector** (`-race`) also catches **data races**: two goroutines (Go's lightweight threads) touching the same memory at once without protection. It needs a C toolchain, which is why it runs in CI rather than on Windows.
-- A **coverage** report (what percentage of code lines the tests executed) is shown on the run's summary page and saved as a downloadable artifact.
-
-### Stage 2: End-to-end tests (does the whole system work for a real user?)
-
-An **end-to-end (e2e) test** runs the real programs exactly as you would by hand.
-[e2e/](e2e/) builds the actual `edgeproxy` and `demobackend` binaries, starts
-them as separate processes on free ports, sends real HTTP requests, and checks
-what comes back:
-
-```mermaid
-sequenceDiagram
-    participant T as Test (Go)
-    participant E as edgeproxy process
-    participant B as demobackend processes
-    T->>B: start 3 backends on free ports
-    T->>E: write a config file, start edgeproxy
-    T->>E: poll /readyz until 200
-    T->>E: send real requests
-    E->>B: forward
-    B-->>E: JSON saying which backend answered
-    E-->>T: response
-    Note over T: assert, e.g. each backend got exactly 10 of 30
-    T->>B: break things: kill a process, fail health checks
-    T->>E: send more requests and assert again
+```bash
+docker run --rm -v "$PWD:/src" -w /src golang:1.26 sh scripts/ci-local.sh
 ```
 
-| Test | What it proves |
-|---|---|
-| `TestRoundRobinSpreadsRequestsEvenly` | 30 requests over 3 backends = exactly 10 each, and the metrics count 30 |
-| `TestRequestIsForwardedIntact` | Method, path and body arrive unchanged; a spoofed `X-Forwarded-For` is replaced by the real IP |
-| `TestUnhealthyBackendIsTakenOutAndBroughtBack` | A backend failing `/healthz` stops getting traffic, then gets traffic again once it recovers |
-| `TestCrashedBackendIsRetriedForGetButNotPost` | Killing a backend process: every `GET` still succeeds via retry, but a `POST` to it returns `502` rather than being replayed |
-| `TestAllBackendsDownReturns503` | Every backend unhealthy → requests get `503` and `/readyz` reports not ready |
-| `TestConsistentHashKeepsEachUserOnOneBackend` | The same `X-User-ID` always reaches the same backend, and users are spread across backends |
-| `TestLeastConnSendsLessTrafficToSlowBackend` | Under concurrent load, a backend with 300 ms latency gets under 20% of traffic (round robin would give it 33%) |
-| `TestGracefulShutdownFinishesInflightRequests` | On `SIGTERM`: `/readyz` turns `503`, a request already in progress still completes with `200`, and the process exits cleanly (Linux only) |
+Or just the fast parts:
 
-In CI the binaries are built with the race detector too, so a data race
-anywhere in a real run fails the build.
-
-Run them yourself:
+```bash
+go test ./...
+```
 
 ```bash
 go test -tags e2e -v ./e2e/
 ```
 
-The `-tags e2e` part is a **build tag**: the e2e files are skipped by a plain
-`go test ./...`, which keeps the everyday unit-test run fast.
-
-**Coming in Phase 3:** rate-limiter e2e tests (send more than the limit and
-expect `429 Too Many Requests` with a `Retry-After` header; run two proxies
-sharing one Redis and check the limit is shared; stop Redis and check
-requests still flow).
+The `-tags e2e` is a **build tag**: the e2e files are skipped by a plain
+`go test ./...`, which keeps the everyday run fast.
