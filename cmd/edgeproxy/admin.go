@@ -12,8 +12,9 @@ import (
 )
 
 // newAdminServer serves operational endpoints on their own port, so metrics
-// and backend details are never exposed on the public listener.
-func newAdminServer(addr string, m *metrics.Metrics, backends []*backend.Backend, draining *atomic.Bool) *http.Server {
+// and backend details are never exposed on the public listener. backends
+// returns the backends currently in rotation.
+func newAdminServer(addr string, m *metrics.Metrics, backends func() []*backend.Backend, draining *atomic.Bool) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", m.Handler())
 
@@ -28,7 +29,7 @@ func newAdminServer(addr string, m *metrics.Metrics, backends []*backend.Backend
 			http.Error(w, "draining", http.StatusServiceUnavailable)
 			return
 		}
-		if !slices.ContainsFunc(backends, (*backend.Backend).Alive) {
+		if !slices.ContainsFunc(backends(), (*backend.Backend).Alive) {
 			http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
 			return
 		}
@@ -39,11 +40,21 @@ func newAdminServer(addr string, m *metrics.Metrics, backends []*backend.Backend
 		type status struct {
 			URL      string `json:"url"`
 			Alive    bool   `json:"alive"`
+			Outlier  string `json:"outlier"`
 			Inflight int64  `json:"inflight"`
+			Weight   int    `json:"weight"`
 		}
-		out := make([]status, len(backends))
-		for i, b := range backends {
-			out[i] = status{URL: b.URL.String(), Alive: b.Alive(), Inflight: b.Inflight()}
+		now := time.Now()
+		bs := backends()
+		out := make([]status, len(bs))
+		for i, b := range bs {
+			out[i] = status{
+				URL:      b.URL.String(),
+				Alive:    b.Alive(),
+				Outlier:  b.Outlier.Mode(now),
+				Inflight: b.Inflight(),
+				Weight:   b.Weight(),
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(w)

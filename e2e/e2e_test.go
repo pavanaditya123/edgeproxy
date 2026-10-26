@@ -111,6 +111,33 @@ func TestCrashedBackendIsRetriedForGetButNotPost(t *testing.T) {
 	}
 }
 
+func TestOutlierDetectionEjectsBackendReturning500s(t *testing.T) {
+	a, c := startBackend(t, "a"), startBackend(t, "c")
+	// bad passes its health checks but fails every real request: only passive
+	// health checking (watching real responses) can catch it.
+	bad := startBackend(t, "bad", "-fail-rate", "1")
+	ep := startProxy(t, proxyOpts{outlierFailures: 3}, a, bad, c)
+
+	for i := 0; i < 15; i++ {
+		ep.fetch(http.MethodGet, "/", nil, "")
+	}
+	if got := ep.status(t, bad).Outlier; got != "ejected" {
+		t.Fatalf("bad backend outlier state = %q, want ejected", got)
+	}
+	if !ep.backendAlive(t, bad) {
+		t.Fatal("bad backend should still pass active health checks; the ejection must come from passive checking")
+	}
+	for i := 0; i < 20; i++ {
+		code, e, err := ep.fetch(http.MethodGet, "/", nil, "")
+		if err != nil || code != http.StatusOK || e.Backend == "bad" {
+			t.Fatalf("request %d after ejection: %d from %q (%v); want 200 from a or c", i, code, e.Backend, err)
+		}
+	}
+	if got := ep.metric(t, "edgeproxy_outlier_ejections_total"); got != 1 {
+		t.Errorf("edgeproxy_outlier_ejections_total = %v, want 1", got)
+	}
+}
+
 func TestAllBackendsDownReturns503(t *testing.T) {
 	a, b := startBackend(t, "a"), startBackend(t, "b")
 	ep := startProxy(t, proxyOpts{}, a, b)

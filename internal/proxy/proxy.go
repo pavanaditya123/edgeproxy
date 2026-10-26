@@ -10,16 +10,16 @@ import (
 	"net/http/httputil"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"edgeproxy/internal/backend"
 	"edgeproxy/internal/balancer"
 	"edgeproxy/internal/metrics"
+	"edgeproxy/internal/outlier"
 )
 
 type Config struct {
-	Backends  []*backend.Backend
-	Balancer  balancer.Balancer
 	Transport http.RoundTripper
 	// MaxRetries is how many other backends a failed retryable request may be tried on.
 	MaxRetries int
@@ -28,27 +28,48 @@ type Config struct {
 }
 
 type Proxy struct {
-	balancer   balancer.Balancer
+	pool       atomic.Pointer[pool]
+	transport  http.RoundTripper
+	errorLog   *log.Logger
 	maxRetries int
-	forwarders map[*backend.Backend]*httputil.ReverseProxy
 	metrics    *metrics.Metrics
 	logger     *slog.Logger
 }
 
+// pool is one immutable generation of backends and the balancer over them.
+// A config reload swaps in a new pool atomically; requests already in
+// progress finish on the pool they started with.
+type pool struct {
+	backends   []*backend.Backend
+	balancer   balancer.Balancer
+	outlier    *outlier.Detector
+	forwarders map[*backend.Backend]*httputil.ReverseProxy
+}
+
+// New returns a proxy with no backends; call SetPool before serving traffic.
 func New(cfg Config) *Proxy {
-	errorLog := slog.NewLogLogger(cfg.Logger.Handler(), slog.LevelWarn)
-	forwarders := make(map[*backend.Backend]*httputil.ReverseProxy, len(cfg.Backends))
-	for _, b := range cfg.Backends {
-		forwarders[b] = newForwarder(b, cfg.Transport, errorLog)
-	}
-	return &Proxy{
-		balancer:   cfg.Balancer,
+	p := &Proxy{
+		transport:  cfg.Transport,
+		errorLog:   slog.NewLogLogger(cfg.Logger.Handler(), slog.LevelWarn),
 		maxRetries: cfg.MaxRetries,
-		forwarders: forwarders,
 		metrics:    cfg.Metrics,
 		logger:     cfg.Logger,
 	}
+	p.pool.Store(&pool{})
+	return p
 }
+
+// SetPool atomically replaces the backends, balancer and outlier detector.
+func (p *Proxy) SetPool(backends []*backend.Backend, bal balancer.Balancer, det *outlier.Detector) {
+	forwarders := make(map[*backend.Backend]*httputil.ReverseProxy, len(backends))
+	for _, b := range backends {
+		forwarders[b] = newForwarder(b, p.transport, p.errorLog)
+	}
+	p.pool.Store(&pool{backends: backends, balancer: bal, outlier: det, forwarders: forwarders})
+}
+
+// Backends returns the backends currently in rotation.
+func (p *Proxy) Backends() []*backend.Backend { return p.pool.Load().backends }
 
 // TransportConfig holds the timeouts for connections from the proxy to backends.
 type TransportConfig struct {
@@ -103,6 +124,7 @@ func newForwarder(b *backend.Backend, transport http.RoundTripper, errorLog *log
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	pl := p.pool.Load()
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 
 	attempts := 1
@@ -110,10 +132,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		attempts += p.maxRetries
 	}
 	var tried []*backend.Backend
-	eligible := func(b *backend.Backend) bool { return b.Alive() && !slices.Contains(tried, b) }
+	eligible := func(b *backend.Backend) bool {
+		return b.Alive() && !b.Outlier.Ejected(time.Now()) && b.HasCapacity() && !slices.Contains(tried, b)
+	}
 
-	for len(tried) < attempts {
-		b := p.balancer.Next(r, eligible)
+	for pl.balancer != nil && len(tried) < attempts {
+		b := pl.balancer.Next(r, eligible)
 		if b == nil {
 			break
 		}
@@ -122,18 +146,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		tried = append(tried, b)
 
-		err := p.forward(rec, r, b)
+		err := p.forward(rec, r, pl, b)
+		if err != nil && r.Context().Err() != nil {
+			// The client went away; there is nobody left to answer, and it's
+			// not the backend's fault. 499 is nginx's "client closed request".
+			p.observe(b.Name(), 499, start)
+			return
+		}
+		p.recordOutcome(pl, b, err != nil || rec.status >= 500)
 		if err == nil {
 			p.observe(b.Name(), rec.status, start)
 			return
 		}
 		p.metrics.UpstreamErrors.WithLabelValues(b.Name()).Inc()
-		if r.Context().Err() != nil {
-			// The client went away; there is nobody left to answer. 499 is
-			// nginx's convention for "client closed request".
-			p.observe(b.Name(), 499, start)
-			return
-		}
 		p.logger.Warn("upstream request failed",
 			"backend", b.Name(), "attempt", len(tried), "method", r.Method, "path", r.URL.Path, "error", err)
 	}
@@ -149,14 +174,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // forward proxies r to b and returns the transport error, if any. A nil error
 // means a response (of any status) was written to w.
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, b *backend.Backend) error {
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, pl *pool, b *backend.Backend) error {
 	b.Acquire()
 	defer b.Release()
 
 	var err error
 	ctx := context.WithValue(r.Context(), attemptErrKey{}, &err)
-	p.forwarders[b].ServeHTTP(w, r.WithContext(ctx))
+	pl.forwarders[b].ServeHTTP(w, r.WithContext(ctx))
 	return err
+}
+
+// recordOutcome feeds passive health checking: a transport error or a 5xx
+// from the backend counts as a failure.
+func (p *Proxy) recordOutcome(pl *pool, b *backend.Backend, failed bool) {
+	if d := pl.outlier.Report(&b.Outlier, failed, time.Now()); d > 0 {
+		p.metrics.OutlierEjections.WithLabelValues(b.Name()).Inc()
+		p.logger.Warn("backend ejected by outlier detection", "backend", b.Name(), "duration", d.String())
+	}
 }
 
 func (p *Proxy) observe(backendName string, status int, start time.Time) {

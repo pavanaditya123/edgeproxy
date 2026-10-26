@@ -19,6 +19,19 @@ type Config struct {
 	Backends    []string    `json:"backends"`
 	HealthCheck HealthCheck `json:"health_check"`
 	Timeouts    Timeouts    `json:"timeouts"`
+
+	// MaxInflightPerBackend caps concurrent requests to any one backend; 0 means no cap.
+	MaxInflightPerBackend int              `json:"max_inflight_per_backend"`
+	OutlierDetection      OutlierDetection `json:"outlier_detection"`
+}
+
+// OutlierDetection configures passive health checking (see package outlier).
+type OutlierDetection struct {
+	// ConsecutiveFailures ejects a backend after this many failed requests in a row; 0 disables it.
+	ConsecutiveFailures int      `json:"consecutive_failures"`
+	BaseEjectionTime    Duration `json:"base_ejection_time"`
+	MaxEjectionTime     Duration `json:"max_ejection_time"`
+	MaxEjectionPercent  int      `json:"max_ejection_percent"`
 }
 
 type HealthCheck struct {
@@ -63,6 +76,8 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 
 func (d Duration) Std() time.Duration { return time.Duration(d) }
 
+func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(time.Duration(d).String()) }
+
 // Default returns the configuration that fields missing from the file fall back to.
 func Default() *Config {
 	return &Config{
@@ -85,6 +100,12 @@ func Default() *Config {
 			IdleConn:       Duration(90 * time.Second),
 			DrainDelay:     0,
 			ShutdownGrace:  Duration(15 * time.Second),
+		},
+		OutlierDetection: OutlierDetection{
+			ConsecutiveFailures: 5,
+			BaseEjectionTime:    Duration(10 * time.Second),
+			MaxEjectionTime:     Duration(5 * time.Minute),
+			MaxEjectionPercent:  50,
 		},
 	}
 }
@@ -156,6 +177,22 @@ func (c *Config) Validate() error {
 	}
 	if t.DrainDelay < 0 {
 		errs = append(errs, errors.New("timeouts.drain_delay must not be negative"))
+	}
+
+	if c.MaxInflightPerBackend < 0 {
+		errs = append(errs, errors.New("max_inflight_per_backend must not be negative"))
+	}
+	od := c.OutlierDetection
+	switch {
+	case od.ConsecutiveFailures < 0:
+		errs = append(errs, errors.New("outlier_detection.consecutive_failures must not be negative"))
+	case od.ConsecutiveFailures > 0:
+		if od.BaseEjectionTime <= 0 || od.MaxEjectionTime < od.BaseEjectionTime {
+			errs = append(errs, errors.New("outlier_detection needs base_ejection_time > 0 and max_ejection_time >= base_ejection_time"))
+		}
+		if od.MaxEjectionPercent < 1 || od.MaxEjectionPercent > 100 {
+			errs = append(errs, errors.New("outlier_detection.max_ejection_percent must be between 1 and 100"))
+		}
 	}
 	return errors.Join(errs...)
 }

@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"edgeproxy/internal/backend"
 	"edgeproxy/internal/balancer"
 	"edgeproxy/internal/config"
 	"edgeproxy/internal/health"
@@ -39,29 +38,8 @@ func run(configPath string, logger *slog.Logger) error {
 		return err
 	}
 
-	backends := make([]*backend.Backend, 0, len(cfg.Backends))
-	for _, raw := range cfg.Backends {
-		b, err := backend.New(raw)
-		if err != nil {
-			return err
-		}
-		backends = append(backends, b)
-	}
-	bal, err := balancer.New(cfg.Strategy, cfg.HashKey, backends)
-	if err != nil {
-		return err
-	}
-	m := metrics.New(backends)
-	checker := health.New(health.Config{
-		Path:               cfg.HealthCheck.Path,
-		Interval:           cfg.HealthCheck.Interval.Std(),
-		Timeout:            cfg.HealthCheck.Timeout.Std(),
-		HealthyThreshold:   cfg.HealthCheck.HealthyThreshold,
-		UnhealthyThreshold: cfg.HealthCheck.UnhealthyThreshold,
-	}, backends, logger)
-	handler := proxy.New(proxy.Config{
-		Backends: backends,
-		Balancer: bal,
+	m := metrics.New()
+	px := proxy.New(proxy.Config{
 		Transport: proxy.NewTransport(proxy.TransportConfig{
 			DialTimeout:           cfg.Timeouts.Dial.Std(),
 			ResponseHeaderTimeout: cfg.Timeouts.ResponseHeader.Std(),
@@ -71,6 +49,24 @@ func run(configPath string, logger *slog.Logger) error {
 		Metrics:    m,
 		Logger:     logger,
 	})
+	m.WatchBackends(px.Backends)
+
+	backends, err := buildBackends(cfg, nil)
+	if err != nil {
+		return err
+	}
+	bal, err := balancer.New(cfg.Strategy, cfg.HashKey, backends)
+	if err != nil {
+		return err
+	}
+	px.SetPool(backends, bal, newDetector(cfg, backends))
+	checker := health.New(health.Config{
+		Path:               cfg.HealthCheck.Path,
+		Interval:           cfg.HealthCheck.Interval.Std(),
+		Timeout:            cfg.HealthCheck.Timeout.Std(),
+		HealthyThreshold:   cfg.HealthCheck.HealthyThreshold,
+		UnhealthyThreshold: cfg.HealthCheck.UnhealthyThreshold,
+	}, backends, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -80,10 +76,10 @@ func run(configPath string, logger *slog.Logger) error {
 	go checker.Run(ctx)
 
 	var draining atomic.Bool
-	admin := newAdminServer(cfg.AdminListen, m, backends, &draining)
+	admin := newAdminServer(cfg.AdminListen, m, px.Backends, &draining)
 	public := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           handler,
+		Handler:           px,
 		ReadHeaderTimeout: cfg.Timeouts.ReadHeader.Std(),
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),

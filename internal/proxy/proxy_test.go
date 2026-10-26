@@ -14,6 +14,7 @@ import (
 	"edgeproxy/internal/backend"
 	"edgeproxy/internal/balancer"
 	"edgeproxy/internal/metrics"
+	"edgeproxy/internal/outlier"
 )
 
 // liveServer answers every request with its name.
@@ -38,7 +39,16 @@ func deadServer() string {
 // backend starts marked alive, as if the health checker hasn't noticed a failure yet.
 func newTestProxy(t *testing.T, urls ...string) (*httptest.Server, []*backend.Backend, *metrics.Metrics) {
 	t.Helper()
+	srv, bs, m, _ := newTestProxyWith(t, nil, urls...)
+	return srv, bs, m
+}
+
+// newTestProxyWith is newTestProxy with an outlier policy (nil disables
+// outlier detection), also returning the Proxy itself.
+func newTestProxyWith(t *testing.T, policy *outlier.Policy, urls ...string) (*httptest.Server, []*backend.Backend, *metrics.Metrics, *Proxy) {
+	t.Helper()
 	bs := make([]*backend.Backend, len(urls))
+	states := make([]*outlier.State, len(urls))
 	for i, u := range urls {
 		b, err := backend.New(u)
 		if err != nil {
@@ -46,11 +56,10 @@ func newTestProxy(t *testing.T, urls ...string) (*httptest.Server, []*backend.Ba
 		}
 		b.SetAlive(true)
 		bs[i] = b
+		states[i] = &b.Outlier
 	}
-	m := metrics.New(bs)
+	m := metrics.New()
 	p := New(Config{
-		Backends: bs,
-		Balancer: balancer.NewRoundRobin(bs),
 		Transport: NewTransport(TransportConfig{
 			DialTimeout: time.Second, ResponseHeaderTimeout: 2 * time.Second, IdleConnTimeout: time.Minute,
 		}),
@@ -58,9 +67,25 @@ func newTestProxy(t *testing.T, urls ...string) (*httptest.Server, []*backend.Ba
 		Metrics:    m,
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
+	var det *outlier.Detector
+	if policy != nil {
+		det = outlier.NewDetector(*policy, states)
+	}
+	p.SetPool(bs, balancer.NewRoundRobin(bs), det)
+	m.WatchBackends(p.Backends)
 	srv := httptest.NewServer(p)
 	t.Cleanup(srv.Close)
-	return srv, bs, m
+	return srv, bs, m, p
+}
+
+// statusServer answers every request with the given status.
+func statusServer(t *testing.T, code int) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(code)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
 }
 
 func do(t *testing.T, req *http.Request) (int, string) {
@@ -158,6 +183,48 @@ func TestProxyReplacesSpoofedForwardedFor(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "6.6.6.6")
 	if _, body := do(t, req); body != "127.0.0.1" {
 		t.Errorf("backend saw X-Forwarded-For %q, want only the real client IP 127.0.0.1", body)
+	}
+}
+
+func TestProxyEjectsBackendThatKeepsReturning5xx(t *testing.T) {
+	policy := &outlier.Policy{ConsecutiveFailures: 3, BaseEjection: time.Minute, MaxEjection: time.Hour, MaxEjectionPercent: 50}
+	srv, bs, m, _ := newTestProxyWith(t, policy, statusServer(t, http.StatusInternalServerError), liveServer(t, "good"))
+
+	// Round robin alternates, so the first 6 requests give the bad backend its 3 failures.
+	for i := 0; i < 6; i++ {
+		get(t, srv.URL)
+	}
+	if !bs[0].Outlier.Ejected(time.Now()) {
+		t.Fatal("backend returning 500s should be ejected after 3 in a row")
+	}
+	for i := 0; i < 10; i++ {
+		if code, body := get(t, srv.URL); code != http.StatusOK || body != "good" {
+			t.Fatalf("after ejection got %d %q, want every request on the good backend", code, body)
+		}
+	}
+	if got := testutil.ToFloat64(m.OutlierEjections.WithLabelValues(bs[0].Name())); got != 1 {
+		t.Errorf("outlier ejections = %v, want 1", got)
+	}
+}
+
+func TestProxySkipsBackendAtCapacity(t *testing.T) {
+	srv, bs, _ := newTestProxy(t, liveServer(t, "a"), liveServer(t, "b"))
+	bs[0].SetMaxInflight(1)
+	bs[0].Acquire() // simulate one request already in flight on a
+	defer bs[0].Release()
+	for i := 0; i < 6; i++ {
+		if _, body := get(t, srv.URL); body != "b" {
+			t.Fatalf("request %d went to %q, want b while a is at capacity", i, body)
+		}
+	}
+}
+
+func TestProxyWithEmptyPoolReturns503(t *testing.T) {
+	p := New(Config{Transport: http.DefaultTransport, Metrics: metrics.New(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+	if code, _ := get(t, srv.URL); code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want 503", code)
 	}
 }
 

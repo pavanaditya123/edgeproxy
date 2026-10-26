@@ -3,6 +3,7 @@ package metrics
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -22,11 +23,19 @@ type Metrics struct {
 	UpstreamErrors *prometheus.CounterVec
 	// Retries counts attempts made on a second or later backend.
 	Retries prometheus.Counter
+	// RetryBudgetExhausted counts retries skipped because the retry budget was empty.
+	RetryBudgetExhausted prometheus.Counter
+	// OutlierEjections counts backends ejected by passive health checking.
+	OutlierEjections *prometheus.CounterVec
+	// RateLimited counts requests rejected with 429, by rule.
+	RateLimited *prometheus.CounterVec
+	// RateLimitFallbacks counts rate-limit checks answered locally because Redis failed.
+	RateLimitFallbacks prometheus.Counter
+	// ConfigReloads counts config reload attempts by result ("success" or "failure").
+	ConfigReloads *prometheus.CounterVec
 }
 
-// New registers all metrics, including per-backend health and load gauges that
-// are read straight from the backends at scrape time.
-func New(backends []*backend.Backend) *Metrics {
+func New() *Metrics {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -52,32 +61,73 @@ func New(backends []*backend.Backend) *Metrics {
 			Name: "edgeproxy_retries_total",
 			Help: "Request attempts retried on another backend.",
 		}),
+		RetryBudgetExhausted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "edgeproxy_retry_budget_exhausted_total",
+			Help: "Retries skipped because the retry budget was empty.",
+		}),
+		OutlierEjections: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "edgeproxy_outlier_ejections_total",
+			Help: "Backends ejected by passive health checking (outlier detection).",
+		}, []string{"backend"}),
+		RateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "edgeproxy_rate_limited_total",
+			Help: "Requests rejected with 429 Too Many Requests, by rate-limit rule.",
+		}, []string{"rule"}),
+		RateLimitFallbacks: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "edgeproxy_rate_limit_fallbacks_total",
+			Help: "Rate-limit checks answered by the local limiter because Redis failed.",
+		}),
+		ConfigReloads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "edgeproxy_config_reloads_total",
+			Help: "Config reload attempts, by result.",
+		}, []string{"result"}),
 	}
-	reg.MustRegister(m.Requests, m.Duration, m.UpstreamErrors, m.Retries)
-
-	for _, b := range backends {
-		labels := prometheus.Labels{"backend": b.Name()}
-		reg.MustRegister(
-			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-				Name:        "edgeproxy_backend_up",
-				Help:        "1 if the backend is passing health checks, else 0.",
-				ConstLabels: labels,
-			}, func() float64 {
-				if b.Alive() {
-					return 1
-				}
-				return 0
-			}),
-			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-				Name:        "edgeproxy_backend_inflight_requests",
-				Help:        "Requests currently being proxied to the backend.",
-				ConstLabels: labels,
-			}, func() float64 { return float64(b.Inflight()) }),
-		)
-	}
+	reg.MustRegister(m.Requests, m.Duration, m.UpstreamErrors, m.Retries, m.RetryBudgetExhausted,
+		m.OutlierEjections, m.RateLimited, m.RateLimitFallbacks, m.ConfigReloads)
 	return m
+}
+
+// WatchBackends exports per-backend gauges for whatever backends source
+// returns at scrape time, so the gauges follow config reloads.
+func (m *Metrics) WatchBackends(source func() []*backend.Backend) {
+	m.Registry.MustRegister(&backendCollector{
+		source: source,
+		up: prometheus.NewDesc("edgeproxy_backend_up",
+			"1 if the backend is passing active health checks, else 0.", []string{"backend"}, nil),
+		inflight: prometheus.NewDesc("edgeproxy_backend_inflight_requests",
+			"Requests currently being proxied to the backend.", []string{"backend"}, nil),
+		ejected: prometheus.NewDesc("edgeproxy_backend_ejected",
+			"1 if outlier detection has ejected the backend, else 0.", []string{"backend"}, nil),
+	})
 }
 
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{})
+}
+
+type backendCollector struct {
+	source                func() []*backend.Backend
+	up, inflight, ejected *prometheus.Desc
+}
+
+func (c *backendCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.up
+	ch <- c.inflight
+	ch <- c.ejected
+}
+
+func (c *backendCollector) Collect(ch chan<- prometheus.Metric) {
+	now := time.Now()
+	for _, b := range c.source() {
+		ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, boolValue(b.Alive()), b.Name())
+		ch <- prometheus.MustNewConstMetric(c.inflight, prometheus.GaugeValue, float64(b.Inflight()), b.Name())
+		ch <- prometheus.MustNewConstMetric(c.ejected, prometheus.GaugeValue, boolValue(b.Outlier.Ejected(now)), b.Name())
+	}
+}
+
+func boolValue(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
 }

@@ -104,6 +104,11 @@ type proxyOpts struct {
 	hashKey        string
 	healthInterval time.Duration
 	drainDelay     time.Duration
+	// outlierFailures enables outlier detection with this consecutive-failure
+	// threshold; 0 leaves it off so it can't interfere with other scenarios.
+	outlierFailures int
+	// extra is merged into the top level of the generated config.
+	extra map[string]any
 }
 
 type edgeProxy struct {
@@ -144,9 +149,16 @@ func startProxy(t *testing.T, opts proxyOpts, backends ...*demoBackend) *edgePro
 			"drain_delay":    opts.drainDelay.String(),
 			"shutdown_grace": "5s",
 		},
+		"outlier_detection": map[string]any{
+			"consecutive_failures": opts.outlierFailures,
+			"base_ejection_time":   "30s",
+		},
 	}
 	if opts.hashKey != "" {
 		cfg["hash_key"] = opts.hashKey
+	}
+	for k, v := range opts.extra {
+		cfg[k] = v
 	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
@@ -222,27 +234,42 @@ func (ep *edgeProxy) whoAnswers(t *testing.T, headers map[string]string) string 
 	return e.Backend
 }
 
-// backendAlive reports what the proxy's /backends endpoint says about b.
-func (ep *edgeProxy) backendAlive(t *testing.T, b *demoBackend) bool {
+type backendStatus struct {
+	URL     string `json:"url"`
+	Alive   bool   `json:"alive"`
+	Outlier string `json:"outlier"`
+	Weight  int    `json:"weight"`
+}
+
+// backends returns the proxy's /backends listing.
+func (ep *edgeProxy) backends(t *testing.T) []backendStatus {
 	t.Helper()
 	code, body := get(ep.adminURL + "/backends")
 	if code != http.StatusOK {
 		t.Fatalf("GET /backends: status %d", code)
 	}
-	var list []struct {
-		URL   string `json:"url"`
-		Alive bool   `json:"alive"`
-	}
+	var list []backendStatus
 	if err := json.Unmarshal([]byte(body), &list); err != nil {
 		t.Fatalf("decode /backends: %v", err)
 	}
-	for _, s := range list {
+	return list
+}
+
+// status reports what the proxy's /backends endpoint says about b.
+func (ep *edgeProxy) status(t *testing.T, b *demoBackend) backendStatus {
+	t.Helper()
+	for _, s := range ep.backends(t) {
 		if s.URL == b.url {
-			return s.Alive
+			return s
 		}
 	}
 	t.Fatalf("/backends does not list %s", b.url)
-	return false
+	return backendStatus{}
+}
+
+func (ep *edgeProxy) backendAlive(t *testing.T, b *demoBackend) bool {
+	t.Helper()
+	return ep.status(t, b).Alive
 }
 
 // metric sums every series of a Prometheus metric, e.g. all
