@@ -265,6 +265,51 @@ func TestP2CSendsLessTrafficToSlowBackend(t *testing.T) {
 	}
 }
 
+func TestConfigReloadAddsAndRemovesBackends(t *testing.T) {
+	a, b := startBackend(t, "a"), startBackend(t, "b")
+	ep := startProxy(t, proxyOpts{}, a, b)
+	c := startBackend(t, "c")
+
+	// Swap a out for c by editing the file on disk; no restart, no signal.
+	ep.rewriteConfig(t, func(cfg map[string]any) { cfg["backends"] = []string{b.url, c.url} })
+	waitFor(t, 5*time.Second, "the reload to swap in backend c", func() bool {
+		list := ep.backends(t)
+		return len(list) == 2 && list[0].URL == b.url && list[1].URL == c.url && list[1].Alive
+	})
+
+	counts := map[string]int{}
+	for i := 0; i < 20; i++ {
+		counts[ep.whoAnswers(t, nil)]++
+	}
+	if counts["a"] != 0 || counts["b"] != 10 || counts["c"] != 10 {
+		t.Errorf("after reload got %v, want b:10 c:10 and nothing on the removed backend a", counts)
+	}
+	if got := ep.metric(t, `edgeproxy_config_reloads_total{result="success"}`); got < 1 {
+		t.Errorf("successful reloads = %v, want at least 1", got)
+	}
+}
+
+func TestInvalidConfigReloadKeepsRunningConfig(t *testing.T) {
+	a := startBackend(t, "a")
+	ep := startProxy(t, proxyOpts{}, a)
+
+	ep.rewriteConfig(t, func(cfg map[string]any) { cfg["strategy"] = "fastest_please" })
+	resp, err := client.Post(ep.adminURL+"/-/reload", "text/plain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("POST /-/reload with an invalid config: status %d, want 400", resp.StatusCode)
+	}
+	if who := ep.whoAnswers(t, nil); who != "a" {
+		t.Errorf("after a rejected reload the proxy should keep serving from a, got %q", who)
+	}
+	if got := ep.metric(t, `edgeproxy_config_reloads_total{result="failure"}`); got < 1 {
+		t.Errorf("failed reloads = %v, want at least 1", got)
+	}
+}
+
 func TestGracefulShutdownFinishesInflightRequests(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("needs SIGTERM, which Windows cannot deliver to another process")

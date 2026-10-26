@@ -19,6 +19,9 @@ go vet -tags e2e ./...
 echo "== unit tests (race detector)"
 go test -race -count=1 ./...
 
+echo "== fuzz the config parser"
+go test -run='^$' -fuzz=FuzzParse -fuzztime="${FUZZTIME:-15s}" ./internal/config/
+
 echo "== end-to-end tests (race-enabled binaries)"
 E2E_RACE=1 go test -tags e2e -count=1 ./e2e/
 

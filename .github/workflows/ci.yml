@@ -73,6 +73,18 @@ jobs:
           name: coverage
           path: coverage.out
 
+      # Throws random mutations of real configs at the parser for 30s, looking
+      # for panics or invalid configs that slip through validation.
+      - name: Fuzz the config parser
+        run: go test -run='^$' -fuzz=FuzzParse -fuzztime=30s ./internal/config/
+
+      - name: Save fuzz failures
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-corpus
+          path: internal/config/testdata/fuzz
+
   e2e:
     name: End-to-end tests
     needs: [lint, unit]

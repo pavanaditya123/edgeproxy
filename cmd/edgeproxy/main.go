@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,9 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"edgeproxy/internal/balancer"
 	"edgeproxy/internal/config"
-	"edgeproxy/internal/health"
 	"edgeproxy/internal/metrics"
 	"edgeproxy/internal/proxy"
 )
@@ -33,9 +32,13 @@ func main() {
 }
 
 func run(configPath string, logger *slog.Logger) error {
-	cfg, err := config.Load(configPath)
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return err
+	}
+	cfg, err := config.Parse(data)
+	if err != nil {
+		return fmt.Errorf("%s: %w", configPath, err)
 	}
 
 	m := metrics.New()
@@ -45,39 +48,27 @@ func run(configPath string, logger *slog.Logger) error {
 			ResponseHeaderTimeout: cfg.Timeouts.ResponseHeader.Std(),
 			IdleConnTimeout:       cfg.Timeouts.IdleConn.Std(),
 		}),
-		MaxRetries:  cfg.MaxRetries,
 		RetryBudget: proxy.NewRetryBudget(cfg.RetryBudget.Ratio, cfg.RetryBudget.MinRetriesPerSecond),
 		Metrics:     m,
 		Logger:      logger,
 	})
 	m.WatchBackends(px.Backends)
 
-	backends, err := buildBackends(cfg, nil)
-	if err != nil {
-		return err
-	}
-	bal, err := balancer.New(cfg.Strategy, cfg.HashKey, backends)
-	if err != nil {
-		return err
-	}
-	px.SetPool(backends, bal, newDetector(cfg, backends))
-	checker := health.New(health.Config{
-		Path:               cfg.HealthCheck.Path,
-		Interval:           cfg.HealthCheck.Interval.Std(),
-		Timeout:            cfg.HealthCheck.Timeout.Std(),
-		HealthyThreshold:   cfg.HealthCheck.HealthyThreshold,
-		UnhealthyThreshold: cfg.HealthCheck.UnhealthyThreshold,
-	}, backends, logger)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Probe once before accepting traffic so the first requests don't hit dead backends.
-	checker.CheckAll(ctx)
-	go checker.Run(ctx)
+	srv := &server{configPath: configPath, boot: cfg, px: px, metrics: m, logger: logger, lastConfigSum: sha256.Sum256(data)}
+	// The first apply probes every backend before the listener opens, so the
+	// first requests don't hit dead backends.
+	if err := srv.apply(ctx, cfg); err != nil {
+		return err
+	}
+	go srv.watch(ctx, cfg.ReloadInterval.Std())
 
 	var draining atomic.Bool
-	admin := newAdminServer(cfg.AdminListen, m, px.Backends, &draining)
+	admin := newAdminServer(cfg.AdminListen, m, px.Backends, &draining, func() error {
+		return srv.reload(ctx, "admin API")
+	})
 	public := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           px,
@@ -90,7 +81,7 @@ func run(configPath string, logger *slog.Logger) error {
 	go func() { errc <- serve(admin) }()
 	go func() { errc <- serve(public) }()
 	logger.Info("edgeproxy started",
-		"listen", cfg.Listen, "admin", cfg.AdminListen, "strategy", cfg.Strategy, "backends", len(backends))
+		"listen", cfg.Listen, "admin", cfg.AdminListen, "strategy", cfg.Strategy, "backends", len(cfg.Backends))
 
 	select {
 	case err := <-errc:

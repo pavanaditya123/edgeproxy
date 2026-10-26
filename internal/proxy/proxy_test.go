@@ -63,15 +63,14 @@ func newTestProxyWith(t *testing.T, policy *outlier.Policy, urls ...string) (*ht
 		Transport: NewTransport(TransportConfig{
 			DialTimeout: time.Second, ResponseHeaderTimeout: 2 * time.Second, IdleConnTimeout: time.Minute,
 		}),
-		MaxRetries: 2,
-		Metrics:    m,
-		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics: m,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	var det *outlier.Detector
 	if policy != nil {
 		det = outlier.NewDetector(*policy, states)
 	}
-	p.SetPool(bs, balancer.NewRoundRobin(bs), det)
+	p.SetPool(PoolConfig{Backends: bs, Balancer: balancer.NewRoundRobin(bs), Outlier: det, MaxRetries: 2})
 	m.WatchBackends(p.Backends)
 	srv := httptest.NewServer(p)
 	t.Cleanup(srv.Close)
@@ -231,6 +230,25 @@ func TestProxySkipsBackendAtCapacity(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		if _, body := get(t, srv.URL); body != "b" {
 			t.Fatalf("request %d went to %q, want b while a is at capacity", i, body)
+		}
+	}
+}
+
+func TestSetPoolSwapsBackendsForNewRequests(t *testing.T) {
+	srv, _, _, p := newTestProxyWith(t, nil, liveServer(t, "old"))
+	if _, body := get(t, srv.URL); body != "old" {
+		t.Fatalf("got %q before the swap, want old", body)
+	}
+	b, err := backend.New(liveServer(t, "new"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.SetAlive(true)
+	bs := []*backend.Backend{b}
+	p.SetPool(PoolConfig{Backends: bs, Balancer: balancer.NewRoundRobin(bs)})
+	for i := 0; i < 5; i++ {
+		if _, body := get(t, srv.URL); body != "new" {
+			t.Fatalf("got %q after the swap, want new", body)
 		}
 	}
 }

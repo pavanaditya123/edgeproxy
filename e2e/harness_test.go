@@ -113,8 +113,29 @@ type proxyOpts struct {
 
 type edgeProxy struct {
 	*process
-	url      string
-	adminURL string
+	url        string
+	adminURL   string
+	configPath string
+	config     map[string]any
+}
+
+// rewriteConfig applies mutate to the proxy's config and writes it back to
+// disk, where the proxy's file watcher picks it up.
+func (ep *edgeProxy) rewriteConfig(t *testing.T, mutate func(cfg map[string]any)) {
+	t.Helper()
+	mutate(ep.config)
+	writeJSON(t, ep.configPath, ep.config)
+}
+
+func writeJSON(t *testing.T, path string, v any) {
+	t.Helper()
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // startProxy runs edgeproxy in front of backends and waits until it is ready.
@@ -153,6 +174,7 @@ func startProxy(t *testing.T, opts proxyOpts, backends ...*demoBackend) *edgePro
 			"consecutive_failures": opts.outlierFailures,
 			"base_ejection_time":   "30s",
 		},
+		"reload_interval": "200ms",
 	}
 	if opts.hashKey != "" {
 		cfg["hash_key"] = opts.hashKey
@@ -160,19 +182,15 @@ func startProxy(t *testing.T, opts proxyOpts, backends ...*demoBackend) *edgePro
 	for k, v := range opts.extra {
 		cfg[k] = v
 	}
-	data, err := json.Marshal(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
 	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeJSON(t, path, cfg)
 
 	ep := &edgeProxy{
-		process:  start(t, "edgeproxy", binPath("edgeproxy"), "-config", path),
-		url:      "http://" + listen,
-		adminURL: "http://" + admin,
+		process:    start(t, "edgeproxy", binPath("edgeproxy"), "-config", path),
+		url:        "http://" + listen,
+		adminURL:   "http://" + admin,
+		configPath: path,
+		config:     cfg,
 	}
 	waitFor(t, 10*time.Second, "edgeproxy to become ready", func() bool {
 		code, _ := get(ep.adminURL + "/readyz")

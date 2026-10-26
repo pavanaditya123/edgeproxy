@@ -13,10 +13,20 @@ import (
 
 // newAdminServer serves operational endpoints on their own port, so metrics
 // and backend details are never exposed on the public listener. backends
-// returns the backends currently in rotation.
-func newAdminServer(addr string, m *metrics.Metrics, backends func() []*backend.Backend, draining *atomic.Bool) *http.Server {
+// returns the backends currently in rotation; reload re-reads the config file.
+func newAdminServer(addr string, m *metrics.Metrics, backends func() []*backend.Backend, draining *atomic.Bool, reload func() error) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", m.Handler())
+
+	// Re-read and apply the config file. Same as sending SIGHUP, but works on
+	// every OS and reports whether the new config was accepted.
+	mux.HandleFunc("POST /-/reload", func(w http.ResponseWriter, _ *http.Request) {
+		if err := reload(); err != nil {
+			http.Error(w, "reload failed, still running the previous config: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte("reloaded\n"))
+	})
 
 	// Liveness: the process is up. Restart it if this fails.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {

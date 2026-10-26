@@ -24,6 +24,10 @@ type Config struct {
 	MaxInflightPerBackend int              `json:"max_inflight_per_backend"`
 	OutlierDetection      OutlierDetection `json:"outlier_detection"`
 	RetryBudget           RetryBudget      `json:"retry_budget"`
+
+	// ReloadInterval is how often the config file is checked for changes; 0 disables
+	// file watching (SIGHUP and POST /-/reload still work).
+	ReloadInterval Duration `json:"reload_interval"`
 }
 
 // RetryBudget caps retries over the last 10 seconds at Ratio of requests, or
@@ -142,7 +146,8 @@ func Default() *Config {
 			MaxEjectionTime:     Duration(5 * time.Minute),
 			MaxEjectionPercent:  50,
 		},
-		RetryBudget: RetryBudget{Ratio: 0.2, MinRetriesPerSecond: 10},
+		RetryBudget:    RetryBudget{Ratio: 0.2, MinRetriesPerSecond: 10},
+		ReloadInterval: Duration(2 * time.Second),
 	}
 }
 
@@ -152,15 +157,27 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg, err := Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+// Parse decodes JSON config on top of Default and validates it.
+func Parse(data []byte) (*Config, error) {
 	cfg := Default()
 	dec := json.NewDecoder(bytes.NewReader(data))
 	// Reject unknown fields so a typo like "max_retires" fails loudly instead of being ignored.
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(cfg); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	if dec.More() {
+		return nil, errors.New("parse: unexpected data after the config object")
 	}
 	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid config %s: %w", path, err)
+		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 	return cfg, nil
 }
@@ -238,6 +255,9 @@ func (c *Config) Validate() error {
 	}
 	if rb := c.RetryBudget; rb.Ratio < 0 || rb.Ratio > 1 || rb.MinRetriesPerSecond < 0 {
 		errs = append(errs, errors.New("retry_budget needs 0 <= ratio <= 1 and min_retries_per_second >= 0"))
+	}
+	if c.ReloadInterval < 0 {
+		errs = append(errs, errors.New("reload_interval must not be negative"))
 	}
 	return errors.Join(errs...)
 }

@@ -21,8 +21,6 @@ import (
 
 type Config struct {
 	Transport http.RoundTripper
-	// MaxRetries is how many other backends a failed retryable request may be tried on.
-	MaxRetries int
 	// RetryBudget caps retries across all requests; nil means no cap.
 	RetryBudget *RetryBudget
 	Metrics     *metrics.Metrics
@@ -30,50 +28,56 @@ type Config struct {
 }
 
 type Proxy struct {
-	pool       atomic.Pointer[pool]
-	transport  http.RoundTripper
-	errorLog   *log.Logger
-	maxRetries int
-	budget     *RetryBudget
-	metrics    *metrics.Metrics
-	logger     *slog.Logger
+	pool      atomic.Pointer[pool]
+	transport http.RoundTripper
+	errorLog  *log.Logger
+	budget    *RetryBudget
+	metrics   *metrics.Metrics
+	logger    *slog.Logger
 }
 
-// pool is one immutable generation of backends and the balancer over them.
-// A config reload swaps in a new pool atomically; requests already in
-// progress finish on the pool they started with.
+// PoolConfig is everything a config reload can change.
+type PoolConfig struct {
+	Backends []*backend.Backend
+	Balancer balancer.Balancer
+	// Outlier drives passive health checking; nil disables it.
+	Outlier *outlier.Detector
+	// MaxRetries is how many other backends a failed retryable request may be tried on.
+	MaxRetries int
+}
+
+// pool is one immutable generation of PoolConfig. A config reload swaps in a
+// new pool atomically; requests already in progress finish on the pool they
+// started with.
 type pool struct {
-	backends   []*backend.Backend
-	balancer   balancer.Balancer
-	outlier    *outlier.Detector
+	PoolConfig
 	forwarders map[*backend.Backend]*httputil.ReverseProxy
 }
 
 // New returns a proxy with no backends; call SetPool before serving traffic.
 func New(cfg Config) *Proxy {
 	p := &Proxy{
-		transport:  cfg.Transport,
-		errorLog:   slog.NewLogLogger(cfg.Logger.Handler(), slog.LevelWarn),
-		maxRetries: cfg.MaxRetries,
-		budget:     cfg.RetryBudget,
-		metrics:    cfg.Metrics,
-		logger:     cfg.Logger,
+		transport: cfg.Transport,
+		errorLog:  slog.NewLogLogger(cfg.Logger.Handler(), slog.LevelWarn),
+		budget:    cfg.RetryBudget,
+		metrics:   cfg.Metrics,
+		logger:    cfg.Logger,
 	}
 	p.pool.Store(&pool{})
 	return p
 }
 
-// SetPool atomically replaces the backends, balancer and outlier detector.
-func (p *Proxy) SetPool(backends []*backend.Backend, bal balancer.Balancer, det *outlier.Detector) {
-	forwarders := make(map[*backend.Backend]*httputil.ReverseProxy, len(backends))
-	for _, b := range backends {
+// SetPool atomically replaces the backends, balancer, outlier detector and retry limit.
+func (p *Proxy) SetPool(cfg PoolConfig) {
+	forwarders := make(map[*backend.Backend]*httputil.ReverseProxy, len(cfg.Backends))
+	for _, b := range cfg.Backends {
 		forwarders[b] = newForwarder(b, p.transport, p.errorLog)
 	}
-	p.pool.Store(&pool{backends: backends, balancer: bal, outlier: det, forwarders: forwarders})
+	p.pool.Store(&pool{PoolConfig: cfg, forwarders: forwarders})
 }
 
 // Backends returns the backends currently in rotation.
-func (p *Proxy) Backends() []*backend.Backend { return p.pool.Load().backends }
+func (p *Proxy) Backends() []*backend.Backend { return p.pool.Load().Backends }
 
 // TransportConfig holds the timeouts for connections from the proxy to backends.
 type TransportConfig struct {
@@ -134,15 +138,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	attempts := 1
 	if isRetryable(r) {
-		attempts += p.maxRetries
+		attempts += pl.MaxRetries
 	}
 	var tried []*backend.Backend
 	eligible := func(b *backend.Backend) bool {
 		return b.Alive() && !b.Outlier.Ejected(time.Now()) && b.HasCapacity() && !slices.Contains(tried, b)
 	}
 
-	for pl.balancer != nil && len(tried) < attempts {
-		b := pl.balancer.Next(r, eligible)
+	for pl.Balancer != nil && len(tried) < attempts {
+		b := pl.Balancer.Next(r, eligible)
 		if b == nil {
 			break
 		}
@@ -196,7 +200,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, pl *pool, b *bac
 // recordOutcome feeds passive health checking: a transport error or a 5xx
 // from the backend counts as a failure.
 func (p *Proxy) recordOutcome(pl *pool, b *backend.Backend, failed bool) {
-	if d := pl.outlier.Report(&b.Outlier, failed, time.Now()); d > 0 {
+	if d := pl.Outlier.Report(&b.Outlier, failed, time.Now()); d > 0 {
 		p.metrics.OutlierEjections.WithLabelValues(b.Name()).Inc()
 		p.logger.Warn("backend ejected by outlier detection", "backend", b.Name(), "duration", d.String())
 	}
