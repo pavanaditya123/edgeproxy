@@ -71,11 +71,11 @@ conditions without Lua/`MULTI`, fail-open vs fail-closed, hot keys.
 
 ## Phase 4 (week 4): observability
 
-- [ ] Request IDs (`X-Request-ID`, generated if missing, propagated upstream)
-- [ ] Structured access logs (method, path, status, latency, backend, bytes, request ID)
-- [ ] **OpenTelemetry tracing** with W3C `traceparent` propagation
-- [ ] Grafana dashboard JSON committed to the repo: RED metrics (Rate, Errors, Duration) per backend
-- [ ] Prometheus alert rules: no healthy backends, error-rate SLO burn, Redis down
+- [x] Request IDs (`X-Request-ID`, generated if missing or unsafe, propagated to the backend and back)
+- [x] Structured access logs (method, path, status, latency, backend, attempts, bytes, request ID, trace ID; never the query string)
+- [x] **OpenTelemetry tracing** with W3C `traceparent` propagation: a server span per request, a client span per backend attempt, OTLP/HTTP export
+- [x] Grafana dashboard JSON committed to the repo: RED metrics (Rate, Errors, Duration) per backend, health, retries, rate limits, runtime
+- [x] Prometheus alert rules: multi-window SLO burn rate, no healthy backends, Redis down, and more, with `promtool` unit tests
 
 ## Phase 5 (week 5): deploy, load test, break it
 
