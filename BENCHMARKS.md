@@ -98,3 +98,16 @@ What made zero failures possible:
 ## Earlier smoke test
 
 1,000 req/s for 30 s: 30,001 requests, 0 errors, p50 1.21 ms, p99 3.36 ms.
+
+## In CI (GitHub Actions, `ubuntu-latest`)
+
+The `Load and chaos tests` job runs the same stack on every push. A run on
+2026-10-26:
+
+| Run | req/s | Errors | p50 | p99 |
+|---|---|---|---|---|
+| Load: 1,000 req/s for 30 s | 1,000 | 0% | 0.44 ms | 1.28 ms |
+| Chaos: 500 req/s for 60 s, with the failures above | 500 | **0%** | 0.43 ms | 50.5 ms |
+
+The build fails if the load test crosses 0.1% errors or 250 ms p99, or the
+chaos test crosses 0.1% errors.
