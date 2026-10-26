@@ -23,7 +23,17 @@ import (
 
 func main() {
 	configPath := flag.String("config", "configs/local.json", "path to the JSON config file")
+	check := flag.Bool("check", false, "validate the config file and exit (like nginx -t)")
 	flag.Parse()
+
+	if *check {
+		if _, err := config.Load(*configPath); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("%s: config ok\n", *configPath)
+		return
+	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(*configPath, logger); err != nil {
