@@ -1,0 +1,148 @@
+# edgeproxy on Kubernetes: two or more replicas behind a Service, finding
+# backend pods through DNS (see demo-backend.yaml).
+#
+#   docker build -t edgeproxy:local .
+#   kind load docker-image edgeproxy:local      # or push to your registry
+#   kubectl apply -k deploy/k8s
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edgeproxy
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edgeproxy-config
+  namespace: edgeproxy
+data:
+  config.json: |
+    {
+      "listen": ":8080",
+      "admin_listen": ":9090",
+      "strategy": "p2c",
+      "backends": [],
+      "discovery": {
+        "dns": [{ "host": "demobackend.edgeproxy.svc.cluster.local", "port": 9001, "scheme": "http" }],
+        "interval": "5s"
+      },
+      "health_check": { "path": "/healthz", "interval": "2s", "timeout": "500ms" },
+      "outlier_detection": { "consecutive_failures": 5, "base_ejection_time": "10s" },
+      "access_log": true,
+      "timeouts": {
+        "drain_delay": "5s",
+        "shutdown_grace": "15s"
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edgeproxy
+  namespace: edgeproxy
+  labels: { app: edgeproxy }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: edgeproxy }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0 # never drop below full capacity during a deploy
+      maxSurge: 1
+  template:
+    metadata:
+      labels: { app: edgeproxy }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      # Must exceed drain_delay + shutdown_grace (5s + 15s), or the kubelet
+      # kills the pod while it's still finishing requests.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: edgeproxy }
+      containers:
+        - name: edgeproxy
+          image: edgeproxy:local
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/etc/edgeproxy/config.json"]
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: admin, containerPort: 9090 }
+          # Readiness gates traffic: it fails while draining after SIGTERM, so
+          # the Service stops routing here before the listener closes.
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 2
+            failureThreshold: 1
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/edgeproxy, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: edgeproxy-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edgeproxy
+  namespace: edgeproxy
+spec:
+  selector: { app: edgeproxy }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+# Metrics and admin endpoints stay off the public Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: edgeproxy-admin
+  namespace: edgeproxy
+spec:
+  selector: { app: edgeproxy }
+  ports:
+    - { name: admin, port: 9090, targetPort: admin }
+---
+# Voluntary disruptions (node drains, upgrades) keep at least one replica up.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: edgeproxy
+  namespace: edgeproxy
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: edgeproxy }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: edgeproxy
+  namespace: edgeproxy
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: edgeproxy }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }

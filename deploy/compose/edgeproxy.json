@@ -1,0 +1,53 @@
+{
+  "listen": ":8080",
+  "admin_listen": ":9090",
+  "strategy": "p2c",
+  "hash_key": "header:X-User-ID",
+  "max_retries": 2,
+  "backends": [
+    "http://backend-a:9001",
+    "http://backend-b:9002",
+    "http://toxiproxy:9103"
+  ],
+  "health_check": {
+    "path": "/healthz",
+    "interval": "1s",
+    "timeout": "500ms",
+    "healthy_threshold": 2,
+    "unhealthy_threshold": 2
+  },
+  "outlier_detection": {
+    "consecutive_failures": 5,
+    "base_ejection_time": "10s",
+    "max_ejection_time": "2m",
+    "max_ejection_percent": 50
+  },
+  "retry_budget": { "ratio": 0.2, "min_retries_per_second": 10 },
+  "max_inflight_per_backend": 512,
+  "reload_interval": "2s",
+  "rate_limit": {
+    "redis": { "addr": "redis:6379", "timeout": "50ms" },
+    "on_redis_error": "local",
+    "rules": [
+      { "name": "login", "path_prefix": "/login", "methods": ["POST"], "limit": 5, "window": "1m" },
+      { "name": "limited", "path_prefix": "/limited", "limit": 20, "window": "10s", "key": "header:X-API-Key" },
+      { "name": "api", "path_prefix": "/api", "limit": 1000000, "window": "1s", "key": "header:X-User-ID" }
+    ]
+  },
+  "access_log": false,
+  "tracing": {
+    "enabled": true,
+    "endpoint": "jaeger:4318",
+    "insecure": true,
+    "sample_ratio": 0.01,
+    "service_name": "edgeproxy"
+  },
+  "timeouts": {
+    "dial": "1s",
+    "read_header": "5s",
+    "response_header": "5s",
+    "idle_conn": "90s",
+    "drain_delay": "2s",
+    "shutdown_grace": "15s"
+  }
+}

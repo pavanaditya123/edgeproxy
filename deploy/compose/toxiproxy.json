@@ -1,0 +1,8 @@
+[
+  {
+    "name": "backend-c",
+    "listen": "0.0.0.0:9103",
+    "upstream": "backend-c:9003",
+    "enabled": true
+  }
+]

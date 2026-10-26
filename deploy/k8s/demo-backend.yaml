@@ -1,0 +1,51 @@
+# Three demo backends behind a *headless* Service (clusterIP: None). A headless
+# Service's DNS name resolves to every ready pod IP instead of one virtual IP,
+# which is how edgeproxy's DNS discovery finds each backend individually.
+#
+#   docker build -t demobackend:local --build-arg TARGET=demobackend .
+#   kind load docker-image demobackend:local
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demobackend
+  namespace: edgeproxy
+  labels: { app: demobackend }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: demobackend }
+  template:
+    metadata:
+      labels: { app: demobackend }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: demobackend
+          image: demobackend:local
+          imagePullPolicy: IfNotPresent
+          args: ["-addr", ":9001"]
+          ports:
+            - { name: http, containerPort: 9001 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+          resources:
+            requests: { cpu: 50m, memory: 16Mi }
+            limits: { memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demobackend
+  namespace: edgeproxy
+spec:
+  clusterIP: None
+  selector: { app: demobackend }
+  ports:
+    - { name: http, port: 9001, targetPort: http }

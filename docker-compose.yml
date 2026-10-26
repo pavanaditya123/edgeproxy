@@ -1,0 +1,97 @@
+# The whole system on one machine:
+#
+#   docker compose up -d --build
+#
+#   edgeproxy-1   http://localhost:8080  (admin :9090)
+#   edgeproxy-2   http://localhost:8081  (admin :9091)
+#   Grafana       http://localhost:3000  (dashboard "edgeproxy")
+#   Prometheus    http://localhost:9095
+#   Jaeger        http://localhost:16686
+#
+# Load test:  docker compose run --rm k6 run /scripts/load.js
+
+x-edgeproxy: &edgeproxy
+  build: .
+  image: edgeproxy:local
+  command: ["-config", "/etc/edgeproxy/config.json"]
+  volumes:
+    - ./deploy/compose/edgeproxy.json:/etc/edgeproxy/config.json:ro
+  depends_on: [backend-a, backend-b, toxiproxy, redis, jaeger]
+  restart: unless-stopped
+
+x-backend: &backend
+  build:
+    context: .
+    args:
+      TARGET: demobackend
+  image: demobackend:local
+  restart: "no"
+
+services:
+  edgeproxy-1:
+    <<: *edgeproxy
+    ports: ["8080:8080", "9090:9090"]
+
+  edgeproxy-2:
+    <<: *edgeproxy
+    ports: ["8081:8080", "9091:9090"]
+
+  backend-a:
+    <<: *backend
+    command: ["-addr", ":9001", "-name", "a"]
+
+  backend-b:
+    <<: *backend
+    command: ["-addr", ":9002", "-name", "b"]
+
+  # backend-c is reached through Toxiproxy, so chaos tests can inject latency
+  # or cut the connection without touching the backend itself.
+  backend-c:
+    <<: *backend
+    command: ["-addr", ":9003", "-name", "c"]
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.13.0
+    command: ["-host", "0.0.0.0", "-config", "/config/toxiproxy.json"]
+    volumes:
+      - ./deploy/compose/toxiproxy.json:/config/toxiproxy.json:ro
+    ports: ["8474:8474"] # control API
+    depends_on: [backend-c]
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9095:9090"]
+
+  grafana:
+    image: grafana/grafana:13.2.4
+    environment:
+      # Read-only anonymous access for local viewing; log in as admin/admin to edit.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/edgeproxy.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0
+    ports: ["16686:16686"]
+
+  # Not started by `up`; run on demand (see the top of this file).
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: [tools]
+    volumes:
+      - ./loadtest/k6:/scripts:ro
+      - ./loadtest/results:/results
+    environment:
+      TARGETS: http://edgeproxy-1:8080,http://edgeproxy-2:8080
