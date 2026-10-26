@@ -32,10 +32,10 @@ in an interview.
 - [x] Graceful shutdown with a drain delay (the Kubernetes-friendly way)
 - [x] JSON config with validation (unknown fields rejected, catching typos)
 - [x] Unit + integration tests, demo backend with latency/failure injection
-- [x] GitHub Actions CI on Linux: gofmt, `go mod tidy` check, `go vet`, build, `go test -race`
+- [x] GitHub Actions CI on Linux, in stages: lint → unit (`-race`, coverage) → e2e
+- [x] End-to-end suite running the real binaries: balancing, forwarding, health ejection, retries, 503, stickiness, least-conn, graceful shutdown on SIGTERM
 - [x] Go installed, tests passing, end-to-end demo verified
-- [ ] Push to GitHub and confirm the first CI run is green (first real `-race` run)
-- [ ] Verify graceful shutdown with a real Ctrl+C / SIGTERM
+- [x] Pushed to GitHub, CI green
 
 **Interview topics:** L4 vs L7, keep-alive and connection pooling, why
 `MaxIdleConnsPerHost` matters, consistent hashing and why only ~1/N keys move,
@@ -63,6 +63,7 @@ why POST isn't retried, liveness vs readiness.
 - [ ] **Failure mode:** if Redis is down, fail open to the local limiter (and expose a metric + alert)
 - [ ] Per-route rules in config (e.g. `/login` 5/min, `/api/*` 100/s)
 - [ ] Measure the added p99 latency of the Redis round trip
+- [ ] **E2E tests in CI** (Redis as a GitHub Actions service container): over-limit requests get `429` + `Retry-After`; two proxies sharing one Redis enforce one shared limit; stopping Redis fails open to the local limiter
 
 **Interview topics:** token bucket vs leaky bucket vs sliding window, race
 conditions without Lua/`MULTI`, fail-open vs fail-closed, hot keys.

@@ -494,7 +494,8 @@ An arrow means "uses". Everything points down towards `backend`, the shared piec
 | [internal/proxy/proxy.go](internal/proxy/proxy.go) | The request handler: the logic in sections 4 and 5, plus the tuned connection pool. |
 | [internal/metrics/metrics.go](internal/metrics/metrics.go) | Defines every Prometheus metric. |
 | [internal/config/config.go](internal/config/config.go) | Defaults, loading, and validation of the config file. |
-| `*_test.go` | Tests next to the code they test. |
+| `*_test.go` | Unit tests, next to the code they test. |
+| [e2e/](e2e/) | End-to-end tests that run the real binaries ([section 13](#13-continuous-integration)). |
 
 ---
 
@@ -510,6 +511,12 @@ go mod tidy
 
 ```bash
 go test ./...
+```
+
+Run the end-to-end tests, which start the real binaries ([section 13](#13-continuous-integration)):
+
+```bash
+go test -tags e2e -v ./e2e/
 ```
 
 Start three demo backends, each in its own terminal. `b` is slow and `c` fails 10% of requests, so there's something to see:
@@ -608,12 +615,94 @@ There are also standard Go runtime metrics (`go_*`, `process_*`): memory, gorout
 
 ## 13. Continuous integration
 
-Every push to `main` and every pull request runs [.github/workflows/ci.yml](.github/workflows/ci.yml) on Linux:
+**CI (continuous integration)** means every change is automatically built and
+tested by a server, so a broken change is caught before anyone relies on it.
+Every push to `main` and every pull request runs
+[.github/workflows/ci.yml](.github/workflows/ci.yml) on a fresh Linux machine,
+in three stages:
+
+```mermaid
+flowchart LR
+    PUSH(["git push or pull request"]) --> LINT
+    PUSH --> UNIT
+    subgraph S1["Stage 1: run side by side"]
+        LINT["Lint<br/>formatting, go.mod tidy,<br/>go vet, build"]
+        UNIT["Unit tests<br/>each package on its own,<br/>race detector, coverage"]
+    end
+    LINT --> E2E
+    UNIT --> E2E
+    subgraph S2["Stage 2: only if both pass"]
+        E2E["End-to-end tests<br/>real edgeproxy + real backends<br/>talking over real HTTP"]
+    end
+    E2E --> OK(["Green tick on the commit"])
+```
+
+### Stage 1a: Lint (is the code well-formed?)
 
 | Step | What it catches |
 |---|---|
 | `gofmt -l .` | Code that isn't in Go's standard formatting |
 | `go mod tidy` + `git diff` | `go.mod` / `go.sum` out of date with the imports |
-| `go vet ./...` | Common mistakes the compiler allows (wrong format strings, copied locks, ...) |
+| `go vet -tags e2e ./...` | Common mistakes the compiler allows (wrong format strings, copied locks, ...), including in the e2e tests |
 | `go build ./...` | Anything that doesn't compile |
-| `go test -race ./...` | Failing tests, plus **data races**: two goroutines touching the same memory at once without protection. The race detector needs a C toolchain, which is why it runs in CI rather than on Windows. |
+
+### Stage 1b: Unit tests (does each piece work alone?)
+
+A **unit test** checks one small piece in isolation, e.g. "given these
+backends, does round robin cycle A, B, C?", without starting the whole program.
+
+- `go test -race ./...` runs every `*_test.go` next to the code.
+- The **race detector** (`-race`) also catches **data races**: two goroutines (Go's lightweight threads) touching the same memory at once without protection. It needs a C toolchain, which is why it runs in CI rather than on Windows.
+- A **coverage** report (what percentage of code lines the tests executed) is shown on the run's summary page and saved as a downloadable artifact.
+
+### Stage 2: End-to-end tests (does the whole system work for a real user?)
+
+An **end-to-end (e2e) test** runs the real programs exactly as you would by hand.
+[e2e/](e2e/) builds the actual `edgeproxy` and `demobackend` binaries, starts
+them as separate processes on free ports, sends real HTTP requests, and checks
+what comes back:
+
+```mermaid
+sequenceDiagram
+    participant T as Test (Go)
+    participant E as edgeproxy process
+    participant B as demobackend processes
+    T->>B: start 3 backends on free ports
+    T->>E: write a config file, start edgeproxy
+    T->>E: poll /readyz until 200
+    T->>E: send real requests
+    E->>B: forward
+    B-->>E: JSON saying which backend answered
+    E-->>T: response
+    Note over T: assert, e.g. each backend got exactly 10 of 30
+    T->>B: break things: kill a process, fail health checks
+    T->>E: send more requests and assert again
+```
+
+| Test | What it proves |
+|---|---|
+| `TestRoundRobinSpreadsRequestsEvenly` | 30 requests over 3 backends = exactly 10 each, and the metrics count 30 |
+| `TestRequestIsForwardedIntact` | Method, path and body arrive unchanged; a spoofed `X-Forwarded-For` is replaced by the real IP |
+| `TestUnhealthyBackendIsTakenOutAndBroughtBack` | A backend failing `/healthz` stops getting traffic, then gets traffic again once it recovers |
+| `TestCrashedBackendIsRetriedForGetButNotPost` | Killing a backend process: every `GET` still succeeds via retry, but a `POST` to it returns `502` rather than being replayed |
+| `TestAllBackendsDownReturns503` | Every backend unhealthy → requests get `503` and `/readyz` reports not ready |
+| `TestConsistentHashKeepsEachUserOnOneBackend` | The same `X-User-ID` always reaches the same backend, and users are spread across backends |
+| `TestLeastConnSendsLessTrafficToSlowBackend` | Under concurrent load, a backend with 300 ms latency gets under 20% of traffic (round robin would give it 33%) |
+| `TestGracefulShutdownFinishesInflightRequests` | On `SIGTERM`: `/readyz` turns `503`, a request already in progress still completes with `200`, and the process exits cleanly (Linux only) |
+
+In CI the binaries are built with the race detector too, so a data race
+anywhere in a real run fails the build.
+
+Run them yourself:
+
+```bash
+go test -tags e2e -v ./e2e/
+```
+
+The `-tags e2e` part is a **build tag**: the e2e files are skipped by a plain
+`go test ./...`, which keeps the everyday unit-test run fast.
+
+**Coming in Phase 3:** rate-limiter e2e tests (send more than the limit and
+expect `429 Too Many Requests` with a `Retry-After` header; run two proxies
+sharing one Redis and check the limit is shared; stop Redis and check
+requests still flow).
