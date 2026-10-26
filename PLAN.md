@@ -32,7 +32,10 @@ in an interview.
 - [x] Graceful shutdown with a drain delay (the Kubernetes-friendly way)
 - [x] JSON config with validation (unknown fields rejected, catching typos)
 - [x] Unit + integration tests, demo backend with latency/failure injection
-- [ ] **You:** install Go, run `go test -race ./...`, run the demo from the README
+- [x] GitHub Actions CI on Linux: gofmt, `go mod tidy` check, `go vet`, build, `go test -race`
+- [x] Go installed, tests passing, end-to-end demo verified
+- [ ] Push to GitHub and confirm the first CI run is green (first real `-race` run)
+- [ ] Verify graceful shutdown with a real Ctrl+C / SIGTERM
 
 **Interview topics:** L4 vs L7, keep-alive and connection pooling, why
 `MaxIdleConnsPerHost` matters, consistent hashing and why only ~1/N keys move,
@@ -78,7 +81,7 @@ conditions without Lua/`MULTI`, fail-open vs fail-closed, hot keys.
 - [ ] `docker-compose.yml`: 2× edgeproxy, Redis, 3× demo backends, Prometheus, Grafana
 - [ ] **k6** load tests; record req/s and p50/p99 for each strategy
 - [ ] **Chaos tests:** kill a backend mid-test, stop Redis, inject latency with Toxiproxy or `tc netem`
-- [ ] GitHub Actions CI: `go vet`, `staticcheck`, `go test -race`, image build
+- [ ] Extend CI: `staticcheck`, `govulncheck`, Docker image build
 - [ ] (Stretch) Kubernetes manifests with readiness probe + `preStop` drain
 
 ## Phase 6 (week 6): polish and tell the story
