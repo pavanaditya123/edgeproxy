@@ -1006,6 +1006,54 @@ scripts/chaos.sh
 RATE=3000 DURATION=20s scripts/bench.sh
 ```
 
+#### Add errors and slowness (to see the dashboard react)
+
+By default the backends never fail, so the error charts stay flat at 0. To see
+errors and slow responses, tell a backend to misbehave. Each backend has two
+settings, both off unless you set them:
+
+| Setting | What it does | Example |
+|---|---|---|
+| `BACKEND_A_FAIL_RATE`, `_B_`, `_C_` | Share of requests that backend answers with an error (`500`). `0.05` = 5%. | `0.05` |
+| `BACKEND_A_LATENCY`, `_B_`, `_C_` | Extra delay on every answer from that backend | `200ms` |
+
+In **PowerShell**, make backend **b** fail 5% of its requests and backend
+**c** slow, then restart just those backends:
+
+```bash
+$env:BACKEND_B_FAIL_RATE="0.05"; $env:BACKEND_C_LATENCY="200ms"; docker compose up -d
+```
+
+Now send traffic. The load test normally *fails on purpose* if more than 0.1%
+of requests fail, so loosen that limit for this demo:
+
+```bash
+docker compose run --rm -e MAX_ERROR_RATE=0.1 -e MAX_P99_MS=2000 k6 run /scripts/load.js
+```
+
+What you'll see in Grafana (http://localhost:3000):
+
+- **Error ratio (5xx)** turns orange/red: about 1–2% (5% of the third of traffic that goes to b).
+- **Responses / s by status** shows a small band of `500`s next to the `200`s.
+- **Latency percentiles** rise, because of the slow backend c.
+- **In-flight requests by backend** is highest for c: slow backends hold requests longer.
+
+Try a bigger number to watch the **circuit breaker** ([section 8](#8-health-checking-active-probes-and-circuit-breakers)) step in. With `BACKEND_B_FAIL_RATE="0.5"`,
+b soon fails 5 requests in a row and is **ejected**: the *Backend health* chart
+marks it orange, its traffic moves to a and c, and the error ratio drops back
+down on its own. After the ejection time it's let back in on trial, fails again,
+and is ejected for twice as long.
+
+Switch everything back to normal (in the same PowerShell window):
+
+```bash
+Remove-Item Env:BACKEND_*; docker compose up -d
+```
+
+(In Git Bash or Linux, write the settings before the command instead, e.g.
+`BACKEND_B_FAIL_RATE=0.05 docker compose up -d`; to switch back, run
+`docker compose up -d` without them.)
+
 Stop it all:
 
 ```bash

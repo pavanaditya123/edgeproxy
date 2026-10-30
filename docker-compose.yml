@@ -36,19 +36,27 @@ services:
     <<: *edgeproxy
     ports: ["8081:8080", "9091:9090"]
 
+  # Each backend can be made to fail a share of requests (with a 500) or answer
+  # slowly, to see errors and latency on the dashboard. Both are off unless set:
+  #
+  #   PowerShell:  $env:BACKEND_B_FAIL_RATE="0.05"; docker compose up -d
+  #   bash:        BACKEND_B_FAIL_RATE=0.05 docker compose up -d
   backend-a:
     <<: *backend
-    command: ["-addr", ":9001", "-name", "a"]
+    command: ["-addr", ":9001", "-name", "a",
+              "-fail-rate", "${BACKEND_A_FAIL_RATE:-0}", "-latency", "${BACKEND_A_LATENCY:-0s}"]
 
   backend-b:
     <<: *backend
-    command: ["-addr", ":9002", "-name", "b"]
+    command: ["-addr", ":9002", "-name", "b",
+              "-fail-rate", "${BACKEND_B_FAIL_RATE:-0}", "-latency", "${BACKEND_B_LATENCY:-0s}"]
 
   # backend-c is reached through Toxiproxy, so chaos tests can inject latency
   # or cut the connection without touching the backend itself.
   backend-c:
     <<: *backend
-    command: ["-addr", ":9003", "-name", "c"]
+    command: ["-addr", ":9003", "-name", "c",
+              "-fail-rate", "${BACKEND_C_FAIL_RATE:-0}", "-latency", "${BACKEND_C_LATENCY:-0s}"]
 
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.13.0
