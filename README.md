@@ -7,10 +7,6 @@ a server breaks.
 
 ---
 
-## Start here (no experience needed)
-
-This part uses no technical word without explaining it. If you have ever used
-an app or a website, you can follow it.
 
 ### What is a "backend"?
 
