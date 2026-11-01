@@ -1,6 +1,6 @@
 # edgeproxy
 
-**In one sentence:** edgeproxy is a smart front door for an app's servers.
+edgeproxy is a smart front door for an app's servers.
 Every user's request comes to it first, and it sends each one to a server
 that is free and working, so the app stays fast and keeps running even when
 a server breaks.
@@ -154,7 +154,7 @@ Right now edgeproxy sends every request to one group of copies. Sending
 
 ---
 
-## For engineers: what's inside
+## what's inside
 
 A Layer-7 HTTP load balancer in Go, built the way production ones (Nginx,
 Envoy, AWS ALB) work, at a size you can read in a weekend:
@@ -174,8 +174,6 @@ failed requests out of 30,001** while a backend was killed, another slowed by
 ---
 
 ## Contents
-
-0. [Start here (no experience needed)](#start-here-no-experience-needed)
 1. [The bank analogy, in detail](#1-the-bank-analogy-in-detail)
 2. [Words you need first](#2-words-you-need-first)
 3. [The whole system in one picture](#3-the-whole-system-in-one-picture)
@@ -199,8 +197,7 @@ failed requests out of 30,001** while a backend was killed, another slowed by
 
 ## 1. The bank analogy, in detail
 
-Start here compared edgeproxy to a bank in 8 jobs. Here is the full comparison, with the real technical name for each idea, so you can match the story to the terms used in the rest of this page.
-
+Start here compared edgeproxy to a bank in 8 jobs
 Picture a bank branch with one **front desk** and several **tellers**.
 
 | In the bank | In edgeproxy |
@@ -226,11 +223,6 @@ Keep this picture in mind; every section below is one row of this table in more 
 ---
 
 ## 2. Words you need first
-
-> **In plain words:** Every technical word used later, explained in everyday language. Skim it now, or come back whenever a word is new.
-
-Each term is used later in this README and in the code.
-
 ### Networking basics
 
 | Term | Plain meaning |
@@ -391,7 +383,7 @@ Go's default pool keeps only **2** idle connections per backend, so under load m
 
 ## 3. The whole system in one picture
 
-> **In plain words:** A map of every part inside edgeproxy and how the parts connect.
+>**A map of every part inside edgeproxy and how the parts connect.
 
 ```mermaid
 flowchart TB
@@ -454,7 +446,7 @@ and logging and tracing sit outside the rate limiter so that even rejected
 
 ## 5. Life of a request when a backend has just crashed
 
-> **In plain words:** What happens, step by step, when one of the copies has just crashed.
+> What happens, step by step, when one of the copies has just crashed.
 
 Backend A has just crashed, and the health checker hasn't noticed yet.
 
@@ -494,7 +486,7 @@ The access log line and the trace both record: backend B, 2 attempts, status 200
 
 ## 6. When does it retry? (and the retry budget)
 
-> **In plain words:** edgeproxy only re-sends a request when repeating it is harmless, and never so often that it makes things worse.
+>edgeproxy only re-sends a request when repeating it is harmless, and never so often that it makes things worse.
 
 ```mermaid
 flowchart TD
@@ -534,7 +526,7 @@ flowchart TD
 
 ## 7. How a backend is chosen (5 strategies)
 
-> **In plain words:** Five different rules edgeproxy can use to decide which copy gets the next request.
+>Five different rules edgeproxy can use to decide which copy gets the next request.
 
 Set with `"strategy"` in the config. Every strategy skips backends that are unhealthy, ejected, at capacity, or already tried for this request.
 
@@ -619,7 +611,7 @@ flowchart TB
 
 ## 8. Health checking: active probes and circuit breakers
 
-> **In plain words:** Two ways of spotting a broken copy: asking it how it is, and watching how it behaves.
+> Two ways of spotting a broken copy: asking it how it is, and watching how it behaves.
 
 edgeproxy finds broken backends two ways, because each catches failures the other misses.
 
@@ -669,7 +661,7 @@ stateDiagram-v2
 
 ## 9. Rate limiting
 
-> **In plain words:** How edgeproxy stops any one user from sending too many requests.
+>How edgeproxy stops any one user from sending too many requests.
 
 A rate limit caps how many requests one client may send. It protects your
 servers from abusive or buggy clients, and expensive endpoints (like login)
@@ -752,7 +744,7 @@ requests failed.
 
 ## 10. Changing config without a restart
 
-> **In plain words:** How you can change edgeproxy's settings while it keeps running.
+> How you can change edgeproxy's settings while it keeps running.
 
 Edit the config file and edgeproxy notices within `reload_interval` (2 s);
 or send `SIGHUP`; or `POST /-/reload` on the admin port.
@@ -793,7 +785,7 @@ emptying the pool.
 
 ## 11. Seeing inside: metrics, logs and traces
 
-> **In plain words:** How you can see what edgeproxy is doing: live charts, a diary of every request, and a timeline of each request's journey.
+>How you can see what edgeproxy is doing: live charts, a diary of every request, and a timeline of each request's journey.
 
 The three ways to see what a running system is doing, and the question each answers:
 
@@ -836,7 +828,7 @@ and come with unit tests.
 
 ## 12. HTTPS (TLS)
 
-> **In plain words:** How edgeproxy keeps users' data private on its way to and from the app.
+>  How edgeproxy keeps users' data private on its way to and from the app.
 
 Set `tls.cert_file` and `tls.key_file` and the public listener speaks HTTPS,
 with HTTP/2 negotiated automatically and TLS 1.2 as the minimum (or 1.3 only).
@@ -857,7 +849,7 @@ flowchart LR
 
 ## 13. Shutting down without dropping requests
 
-> **In plain words:** How edgeproxy switches off politely, finishing the work in progress first.
+> How edgeproxy switches off politely, finishing the work in progress first.
 
 ```mermaid
 sequenceDiagram
@@ -885,7 +877,7 @@ sequenceDiagram
 
 ## 14. Where each piece lives in the code
 
-> **In plain words:** Which folder holds which part of the program.
+> Which folder holds which part of the program.
 
 ```mermaid
 flowchart LR
@@ -1056,31 +1048,8 @@ Stop it all:
 docker compose down
 ```
 
-### Option B: just the Go programs
 
-You need **Go 1.26 or newer** ([download](https://go.dev/dl/)). Start three demo backends, each in its own terminal (`b` is slow, `c` fails 10% of requests):
 
-```bash
-go run ./cmd/demobackend -addr :9001 -name a
-```
-
-```bash
-go run ./cmd/demobackend -addr :9002 -name b -latency 50ms
-```
-
-```bash
-go run ./cmd/demobackend -addr :9003 -name c -fail-rate 0.1
-```
-
-Then the proxy:
-
-```bash
-go run ./cmd/edgeproxy -config configs/local.json
-```
-
-```bash
-curl -s localhost:8080/hello
-```
 
 ### Experiments to try
 
@@ -1095,7 +1064,7 @@ curl -s localhost:8080/hello
 | `curl -s -H "X-Forwarded-For: 6.6.6.6" localhost:8080/` | The backend sees your real IP, not 6.6.6.6 | [2](#observability-and-security) |
 | `go run ./cmd/edgeproxy -check -config configs/local.json` | Validates a config without starting anything | [16](#16-config-file-every-field-explained) |
 
-### Option C: Kubernetes
+### Option B: Kubernetes
 
 [deploy/k8s](deploy/k8s/) has production-style manifests:
 
@@ -1286,15 +1255,3 @@ flowchart LR
 docker run --rm -v "$PWD:/src" -w /src golang:1.26 sh scripts/ci-local.sh
 ```
 
-Or just the fast parts:
-
-```bash
-go test ./...
-```
-
-```bash
-go test -tags e2e -v ./e2e/
-```
-
-The `-tags e2e` is a **build tag**: the e2e files are skipped by a plain
-`go test ./...`, which keeps the everyday run fast.
