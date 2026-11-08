@@ -99,11 +99,3 @@ conditions without Lua/`MULTI`, fail-open vs fail-closed, hot keys.
 - [ ] Grafana screenshot in the README (take one from http://localhost:3000 while `docker compose run --rm k6 run /scripts/load.js` runs)
 
 ---
-
-## Resume bullets (real, measured numbers)
-
-- Built a production-style Layer-7 load balancer in Go with 5 balancing strategies (incl. power-of-two-choices and consistent hashing), sustaining **3,000 req/s at 1.4 ms p50 / ~6 ms p99** with 0 errors in a containerised benchmark
-- Designed active health checks, per-backend circuit breakers and budgeted retries; chaos tests that killed a backend, injected 500 ms latency and stopped Redis under load produced **0 failed requests out of 30,001**
-- Implemented a distributed sliding-window rate limiter with an atomic Redis Lua script shared across proxy replicas, adding only **0.45 ms p50**, with automatic fallback to sharded, memory-bounded local token buckets during Redis outages
-- Added hot config reload, DNS service discovery, TLS with certificate rotation, and graceful draining for zero-downtime Kubernetes rollouts
-- Instrumented RED metrics, OpenTelemetry tracing and SLO burn-rate alerts (unit-tested with promtool); gated every commit on 91 tests, fuzzing, the race detector, govulncheck and k6 load/chaos tests in GitHub Actions
